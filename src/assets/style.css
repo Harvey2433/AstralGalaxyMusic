@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 强制应用深空背景，防止出现白边 */
+body {
+    @apply bg-cosmos-950 text-cosmos-100 overflow-hidden;
+}
+/* ... 之前的 @tailwind 代码保持不变 ... */
+
+/* =========================================
+   星际滚动条样式 (Holographic Scrollbar)
+   ========================================= */
+
+/* 1. 设置滚动条的整体宽度/高度 */
+::-webkit-scrollbar {
+    width: 6px;  /* 纵向滚动条宽度：极细 */
+    height: 6px; /* 横向滚动条高度 */
+  }
+  
+  /* 2. 滚动轨道 (Track)：完全隐形 */
+  ::-webkit-scrollbar-track {
+    background: transparent; 
+    /* 如果想要一点底色，可以用这个： background: rgba(255, 255, 255, 0.02); */
+  }
+  
+  /* 3. 滑块 (Thumb)：默认状态 */
+  ::-webkit-scrollbar-thumb {
+    background: rgba(100, 255, 218, 0.1); /* starlight-cyan (10%透明度) */
+    border-radius: 9999px; /* 圆角，像胶囊一样 */
+    border: 1px solid rgba(100, 255, 218, 0.05); /* 极淡的边框 */
+  }
+  
+  /* 4. 滑块：鼠标悬停状态 (激活充能) */
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(100, 255, 218, 0.5); /* 变亮，50%透明度 */
+    box-shadow: 0 0 10px rgba(100, 255, 218, 0.3); /* 增加一点光晕 */
+  }
+  
+  /* 5. 边角 (Corner)：透明 */
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }

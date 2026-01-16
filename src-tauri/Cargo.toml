@@ -1,0 +1,46 @@
+[package]
+name = "astralgalaxymusicplayer"
+version = "0.1.0"
+description = "A next-gen music player"
+authors = ["you"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0-beta", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0-beta", features = [] }
+tauri-plugin-opener = "2.0.0-beta"
+tauri-plugin-shell = "2.0.0-beta"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 🔥 核心音频栈
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
+# 🔥 内存映射 (实现零拷贝、秒开的关键)
+memmap2 = "0.9"
+ringbuf = "0.4"
+# 元数据与工具
+lofty = "0.15"
+rfd = "0.14"
+base64 = "0.21"
+rayon = "1.8"
+encoding_rs = "0.8"
+claxon = "0.4"
+symphonia = { version = "0.5", features = [
+    "flac",
+    "wav",
+    "mp3",
+    "aac",
+    "alac",
+] }
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# 发布模式保持最高优化 + LTO
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
