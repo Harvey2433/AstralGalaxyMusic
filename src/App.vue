@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, nextTick } from 'vue';
+import { ref, onMounted, computed, watch, nextTick } from 'vue';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { usePlayerStore } from './stores/player'; 
@@ -8,10 +8,13 @@ import {
   Heart, Shuffle, Repeat, Volume1, VolumeX, Volume2,
   Cpu, Zap, HardDrive, Film, CheckCircle2, Terminal, Loader2, AlertCircle,
   Monitor, Sliders, LogOut, LayoutDashboard, ScanEye, Repeat1, AlertTriangle, PlusCircle, AudioLines, Speaker,
-  Activity, Radio, Mic2, MoveHorizontal, ChevronUp, ChevronDown
+  Activity, Radio, ChevronUp, ChevronDown 
 } from 'lucide-vue-next';
 
 const player = usePlayerStore();
+
+// --- 常量定义 (修复 DEFAULT_COVER 缺失报错) ---
+const DEFAULT_COVER = 'https://images.unsplash.com/photo-1614728853913-6591d801d643?q=80&w=400&auto=format&fit=crop';
 
 // --- 歌词逻辑 (酷狗级逐字渲染引擎) ---
 const showLyrics = ref(false); 
@@ -97,15 +100,15 @@ watch(() => player.currentTime, (time) => {
   }
 });
 
-// 计算物理滚动偏移量 (修复居中问题)
+// 计算物理滚动偏移量 (居中算法)
 const updateScrollPosition = () => {
   if (!lyricsWrapperRef.value || !lyricsWrapperRef.value.children.length) return;
   const activeEl = lyricsWrapperRef.value.children[activeLineIndex.value] as HTMLElement;
-  
   if (activeEl) {
-    // 修复：直接计算元素中心点相对于顶部的距离，配合 top: 50% 实现绝对居中
-    // 偏移量 = -(元素顶部位置 + 元素高度的一半)
-    scrollOffset.value = -(activeEl.offsetTop + activeEl.clientHeight / 2);
+    // 歌词容器视口高度的一半
+    const containerHeight = lyricsWrapperRef.value.parentElement?.clientHeight || 600;
+    // 计算偏移：让当前行中心 对齐 视口中心
+    scrollOffset.value = -(activeEl.offsetTop - containerHeight / 2 + activeEl.clientHeight / 2);
   }
 };
 
@@ -304,7 +307,7 @@ onMounted(() => {
           <div v-if="activeTab === 'likes'" class="absolute inset-0 z-20 flex flex-col p-10 overflow-y-auto scrollbar-hide">
              <h2 class="text-4xl font-bold font-orbitron text-white mb-8 flex items-center gap-4"><Heart :size="32" class="text-red-500 fill-red-500" /> LIKED TRACKS</h2>
              <div class="grid grid-cols-1 gap-2">
-                <div v-for="(track, index) in player.likedQueue" :key="track.id" @dblclick="player.playTrack(track)" class="flex items-center gap-4 p-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all group cursor-pointer">
+                <div v-for="track in player.likedQueue" :key="track.id" @dblclick="player.playTrack(track)" class="flex items-center gap-4 p-4 rounded-xl bg-white/5 hover:bg-white/10 transition-all group cursor-pointer">
                    <div class="relative w-12 h-12 rounded-lg overflow-hidden"><img :src="track.cover" class="w-full h-full object-cover" /><div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all"><Play :size="20" class="text-white fill-white"/></div></div>
                    <div class="flex-1"><div class="text-white font-bold">{{ track.title }}</div><div class="text-white/40 text-xs">{{ track.artist }}</div></div>
                    <button @click.stop="player.toggleLike(track)" class="text-red-500 hover:scale-110 transition-transform"><Heart :size="20" class="fill-red-500"/></button>
@@ -576,9 +579,8 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 .slide-up-enter-from, .slide-up-leave-to { opacity: 0; transform: translateY(20px); filter: blur(5px); }
 
 .mask-gradient {
-  /* 扩大遮罩范围，显示更多上下文 */
-  mask-image: linear-gradient(to bottom, transparent 0%, black 10%, black 90%, transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 10%, black 90%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
 }
 .scrollbar-hide::-webkit-scrollbar { display: none; }
 .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
@@ -588,7 +590,7 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 
 /* --- 酷狗级歌词核心样式 (Kugou Style) --- */
 .kugou-text {
-  /* 默认底色：冷白 (半透明度提升到 0.6，防止看不清) */
+  /* 默认底色：冷白 (半透明度提升到 0.6) */
   color: rgba(255, 255, 255, 0.6); 
   position: relative;
   z-index: 1;
@@ -596,7 +598,7 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 
 /* 激活态：逐字填充 */
 .lyric-line.active .kugou-text {
-  /* 渐变：左侧高亮(亮白) -> 右侧透明 (透出下方的 ::after 底色) */
+  /* 渐变：左侧高亮(亮白+青) -> 右侧透明 (透出下方的 ::after 底色) */
   background-image: linear-gradient(to right, #ffffff var(--prog), transparent var(--prog));
   -webkit-background-clip: text;
   background-clip: text;
@@ -615,13 +617,12 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 /* 聚焦效果 */
 .lyric-line.active {
   transform: scale(1.15);
-  filter: drop-shadow(0 0 12px rgba(100, 255, 218, 0.4)); /* 冰蓝光晕，增强冷白感 */
+  filter: drop-shadow(0 0 12px rgba(100, 255, 218, 0.4)); /* 冰蓝光晕 */
   opacity: 1;
 }
 .lyric-line.near {
   transform: scale(0.95);
   opacity: 0.8;
-  /* 移除 blur 以提升性能，改用 opacity 区分 */
 }
 .lyric-line.far {
   transform: scale(0.85);
