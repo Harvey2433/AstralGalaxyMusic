@@ -12,24 +12,30 @@ import {
 } from 'lucide-vue-next';
 
 const player = usePlayerStore();
+const appWindow = getCurrentWindow();
 
-// --- 常量定义 (修复 DEFAULT_COVER 缺失报错) ---
+// --- 常量定义 ---
 const DEFAULT_COVER = 'https://images.unsplash.com/photo-1614728853913-6591d801d643?q=80&w=400&auto=format&fit=crop';
 
-// --- 歌词逻辑 (酷狗级逐字渲染引擎) ---
+// --- 窗口控制函数 (修复 TS 报错) ---
+const closeWindow = () => appWindow.close();
+const minimize = () => appWindow.minimize();
+const toggleMaximize = async () => { 
+  const isMax = await appWindow.isMaximized(); 
+  isMax ? appWindow.unmaximize() : appWindow.maximize(); 
+};
+
+// --- 歌词逻辑 (酷狗级逐字渲染 + 绝对居中) ---
 const showLyrics = ref(false); 
-// 增加 duration 字段，用于计算单句进度
 const lyricsLines = ref<{ time: number; text: string; duration: number }[]>([]);
 const activeLineIndex = ref(-1);
 const lineProgress = ref(0); 
 const scrollOffset = ref(0);
 const lyricsWrapperRef = ref<HTMLElement | null>(null);
 
-// 解析 LRC 并预计算每行持续时间
 const parseLrc = (lrc: string) => {
   const lines: { time: number; text: string; duration: number }[] = [];
   const regex = /\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)/;
-  
   const rawLines = lrc.split('\n');
   const tempLines: { time: number; text: string }[] = [];
 
@@ -47,97 +53,87 @@ const parseLrc = (lrc: string) => {
 
   tempLines.sort((a, b) => a.time - b.time);
 
-  // 智能计算 duration：当前行时间 到 下一行时间 的差值
   for (let i = 0; i < tempLines.length; i++) {
     const current = tempLines[i];
     const next = tempLines[i + 1];
-    // 如果是最后一行，默认给 5秒，防止进度条卡死
     const duration = next ? (next.time - current.time) : 5.0; 
     lines.push({ ...current, duration });
   }
-
   return lines;
 };
 
 const loadLyrics = async () => {
-  lyricsLines.value = [];
-  activeLineIndex.value = -1;
-  lineProgress.value = 0;
-  scrollOffset.value = 0; 
+  lyricsLines.value = []; activeLineIndex.value = -1; lineProgress.value = 0; scrollOffset.value = 0;
   if (!player.currentTrack) return;
-  
   try {
     const lrcContent = await invoke<string>('get_lyrics', { path: player.currentTrack.path });
-    if (lrcContent) {
-      lyricsLines.value = parseLrc(lrcContent);
-    }
+    if (lrcContent) lyricsLines.value = parseLrc(lrcContent);
   } catch (e) { console.error(e); }
 };
 
 watch(() => player.currentTrack?.id, loadLyrics);
 
-// 核心：高频渲染循环 (驱动卡拉OK动画)
 watch(() => player.currentTime, (time) => {
   if (!showLyrics.value || lyricsLines.value.length === 0) return;
 
-  // 1. 查找当前行
   let currentIdx = lyricsLines.value.findIndex(line => line.time > time);
   if (currentIdx === -1) currentIdx = lyricsLines.value.length - 1;
   else if (currentIdx > 0) currentIdx = currentIdx - 1;
 
-  // 2. 更新滚动位置 (防抖)
   if (currentIdx !== activeLineIndex.value) {
     activeLineIndex.value = currentIdx;
     updateScrollPosition();
   }
 
-  // 3. 计算酷狗级填充进度
   if (currentIdx !== -1) {
     const currentLine = lyricsLines.value[currentIdx];
     const timeInLine = time - currentLine.time;
-    // 限制在 0% - 100%
     lineProgress.value = Math.max(0, Math.min(100, (timeInLine / currentLine.duration) * 100));
   }
 });
 
-// 计算物理滚动偏移量 (居中算法)
+// 🔥 修复：绝对居中滚动算法
 const updateScrollPosition = () => {
-  if (!lyricsWrapperRef.value || !lyricsWrapperRef.value.children.length) return;
-  const activeEl = lyricsWrapperRef.value.children[activeLineIndex.value] as HTMLElement;
-  if (activeEl) {
-    // 歌词容器视口高度的一半
-    const containerHeight = lyricsWrapperRef.value.parentElement?.clientHeight || 600;
-    // 计算偏移：让当前行中心 对齐 视口中心
-    scrollOffset.value = -(activeEl.offsetTop - containerHeight / 2 + activeEl.clientHeight / 2);
-  }
+  requestAnimationFrame(() => {
+    if (!lyricsWrapperRef.value || !lyricsWrapperRef.value.children.length) return;
+    const activeEl = lyricsWrapperRef.value.children[activeLineIndex.value] as HTMLElement;
+    
+    if (activeEl) {
+      // 逻辑：Wrapper 的 top 设为了 50% (屏幕正中间)
+      // 我们需要将列表向上移动，移动的距离 = (当前行距离顶部的距离 + 当前行高度的一半)
+      // 这样当前行的中心点就会准确落在屏幕的 50% 线上
+      const elementCenter = activeEl.offsetTop + activeEl.offsetHeight / 2;
+      scrollOffset.value = -elementCenter;
+    }
+  });
 };
 
 const toggleLyricsView = (state?: boolean) => {
   showLyrics.value = state !== undefined ? state : !showLyrics.value;
   if (showLyrics.value) {
      nextTick(() => {
-        // 进入时强制重算一次位置
-        updateScrollPosition();
+        // 稍微延迟以确保 DOM 布局完成，计算更准确
+        setTimeout(() => updateScrollPosition(), 50);
      });
   }
 };
 
-// --- 灵动岛逻辑 ---
+// --- UI Logic ---
+const activeTab = ref('dashboard');
+const showSettings = ref(false);
+const switchTab = (t: string) => { activeTab.value = t; showSettings.value = t === 'settings'; };
+const switchToMain = () => { showSettings.value = false; activeTab.value = 'dashboard'; };
+
 type IslandMode = 'idle' | 'notification' | 'media' | 'error' | 'loading'; 
 const notificationText = ref('');
 const isNotificationVisible = ref(false);
 const isError = ref(false); 
 let notificationTimer: any = null;
-
 const notify = (text: string, type: 'info' | 'error' = 'info') => {
   if (notificationTimer) clearTimeout(notificationTimer);
-  notificationText.value = text;
-  isError.value = type === 'error';
-  isNotificationVisible.value = true;
-  const duration = type === 'error' ? 3000 : 2000;
-  notificationTimer = setTimeout(() => { isNotificationVisible.value = false; isError.value = false; }, duration);
+  notificationText.value = text; isError.value = type === 'error'; isNotificationVisible.value = true;
+  setTimeout(() => { isNotificationVisible.value = false; isError.value = false; }, type === 'error' ? 3000 : 2000);
 };
-
 const currentIslandMode = computed<IslandMode>(() => {
   if (isNotificationVisible.value) return isError.value ? 'error' : 'notification';
   if (player.isBuffering || player.isSeeking) return 'loading'; 
@@ -145,84 +141,36 @@ const currentIslandMode = computed<IslandMode>(() => {
   return 'idle';
 });
 
-// --- 声道与设备 ---
-const currentChannel = ref(2);
-const setChannel = (ch: number) => {
-  currentChannel.value = ch;
-  player.setChannelMode(ch);
-  notify(`AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`);
-};
-
-const selectOutputDevice = (e: Event) => {
-  const target = e.target as HTMLSelectElement;
-  player.setOutputDevice(target.value);
-};
-
-// --- 窗口 ---
-const appWindow = getCurrentWindow();
-const minimize = () => appWindow.minimize();
-const toggleMaximize = async () => { const isMax = await appWindow.isMaximized(); isMax ? appWindow.unmaximize() : appWindow.maximize(); };
-const closeWindow = () => appWindow.close();
-
-const activeTab = ref('dashboard'); 
-const showSettings = ref(false); 
-watch(activeTab, (n) => { if (n !== 'settings') notify(`${n.toUpperCase()} MODULE`); });
-watch(showSettings, (v) => { if (v) notify('SYSTEM CONFIGURATION'); });
-const switchTab = (t: string) => { activeTab.value = t; showSettings.value = t === 'settings'; };
-const switchToMain = () => { showSettings.value = false; activeTab.value = 'dashboard'; };
-
-// --- 引擎设置 ---
 const activeSettingTab = ref('core');
 const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
-
 const engines = [
   { id: 'galaxy', name: 'GalaxyCore', sub: 'HYPERION', icon: Cpu, color: 'text-starlight-cyan', border: 'border-starlight-cyan', glow: 'shadow-[0_0_15px_rgba(100,255,218,0.3)]', desc: 'Native Rust (Zero-Copy)' },
   { id: 'bass', name: 'BASS Audio', sub: 'AUDIOPHILE', icon: Zap, color: 'text-yellow-400', border: 'border-yellow-400', glow: 'shadow-[0_0_15px_rgba(250,204,21,0.3)]', desc: 'Audiophile Grade' },
   { id: 'mci', name: 'Windows MCI', sub: 'LEGACY', icon: HardDrive, color: 'text-blue-400', border: 'border-blue-400', glow: 'shadow-[0_0_15px_rgba(96,165,250,0.3)]', desc: 'Legacy System' },
   { id: 'ffmpeg', name: 'FFmpeg', sub: 'UNIVERSAL', icon: Film, color: 'text-purple-400', border: 'border-purple-400', glow: 'shadow-[0_0_15px_rgba(192,132,252,0.3)]', desc: 'Universal Format' }
 ];
-
 const selectEngine = async (id: string) => {
   if (engineState.value === 'switching' || player.activeEngine === id) return;
-  targetEngineId.value = id; 
-  engineState.value = 'switching';
-  notify(`INITIALIZING ${id.toUpperCase()}...`);
+  targetEngineId.value = id; engineState.value = 'switching'; notify(`INITIALIZING ${id.toUpperCase()}...`);
   const result = await player.switchEngine(id);
-  if (result === true) {
-    engineState.value = 'success';
-    notify(`${id.toUpperCase()} ENGINE READY`);
-    setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500);
-  } else {
-    engineState.value = 'failed';
-    notify(`FAILED TO LOAD ${id.toUpperCase()}`, 'error');
-    setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000);
-  }
+  if (result === true) { engineState.value = 'success'; notify(`${id.toUpperCase()} ENGINE READY`); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500); } 
+  else { engineState.value = 'failed'; notify(`FAILED TO LOAD ${id.toUpperCase()}`, 'error'); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
 };
 
-// --- 控制与交互 ---
+const currentChannel = ref(2);
+const setChannel = (ch: number) => { currentChannel.value = ch; player.setChannelMode(ch); notify(`AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`); };
+const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as HTMLSelectElement).value); };
 const volumeBarRef = ref<HTMLElement | null>(null);
 const isDraggingVol = ref(false);
 const VolumeIcon = computed(() => { if(player.volume===0)return VolumeX; if(player.volume<50)return Volume1; return Volume2; });
-
 const updateVolume = (e: MouseEvent) => { if(!volumeBarRef.value)return; const rect = volumeBarRef.value.getBoundingClientRect(); player.volume = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100)); };
 const startVolumeDrag = (e: MouseEvent) => { isDraggingVol.value = true; updateVolume(e); window.addEventListener('mousemove', onVolumeDrag); window.addEventListener('mouseup', stopVolumeDrag); };
 const onVolumeDrag = (e: MouseEvent) => { if(isDraggingVol.value) updateVolume(e); };
 const stopVolumeDrag = () => { isDraggingVol.value = false; window.removeEventListener('mousemove', onVolumeDrag); window.removeEventListener('mouseup', stopVolumeDrag); };
-
 const localProgress = ref(0);
-const onProgressInput = (e: Event) => {
-    const target = e.target as HTMLInputElement;
-    player.isDragging = true; 
-    localProgress.value = parseFloat(target.value);
-};
-const onProgressChange = (e: Event) => {
-    const target = e.target as HTMLInputElement;
-    const val = parseFloat(target.value);
-    player.seekTo(val);
-    setTimeout(() => { player.isDragging = false; }, 100);
-};
-
+const onProgressInput = (e: Event) => { player.isDragging = true; localProgress.value = parseFloat((e.target as HTMLInputElement).value); };
+const onProgressChange = (e: Event) => { player.seekTo(parseFloat((e.target as HTMLInputElement).value)); setTimeout(() => { player.isDragging = false; }, 100); };
 const toggleMute = () => { player.volume = player.volume > 0 ? 0 : 50; };
 
 onMounted(() => { 
@@ -244,41 +192,14 @@ onMounted(() => {
       ]"
     >
       <div class="absolute inset-0 bg-gradient-to-b from-white/[0.05] to-transparent pointer-events-none z-0 col-start-1 row-start-1 w-full h-full"></div>
-      
-      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'loading' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
-        <Loader2 :size="16" class="text-starlight-cyan animate-spin shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">PROCESSING</span>
-      </div>
-
-      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'notification' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
-        <ScanEye :size="16" class="text-starlight-cyan animate-pulse shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap overflow-hidden text-ellipsis min-w-0">{{ notificationText }}</span>
-      </div>
-
-      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'error' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
-        <AlertTriangle :size="16" class="text-red-500 animate-pulse shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-red-100 whitespace-nowrap">{{ notificationText }}</span>
-      </div>
-
-      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-4 w-full justify-between min-w-0" :class="currentIslandMode === 'media' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
-        <div class="w-8 h-8 rounded-full overflow-hidden border border-white/20 relative shrink-0">
-            <img :src="player.currentTrack?.cover" class="w-full h-full object-cover animate-spin-slow" />
-        </div>
-        <div class="flex flex-col justify-center flex-1 min-w-0 py-1 overflow-hidden">
-            <span class="text-xs font-bold text-white leading-tight truncate text-left">{{ player.currentTrack?.title }}</span>
-        </div>
-        <div class="flex items-end gap-[2px] h-4 shrink-0 ml-auto">
-            <div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-1" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
-            <div class="w-[2px] bg-starlight-purple rounded-full animate-wave-2" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
-            <div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-3" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
-        </div>
-      </div>
+      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'loading' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'"><Loader2 :size="16" class="text-starlight-cyan animate-spin shrink-0" /><span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">PROCESSING</span></div>
+      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'notification' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'"><ScanEye :size="16" class="text-starlight-cyan animate-pulse shrink-0" /><span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap overflow-hidden text-ellipsis min-w-0">{{ notificationText }}</span></div>
+      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'error' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'"><AlertTriangle :size="16" class="text-red-500 animate-pulse shrink-0" /><span class="text-[10px] font-mono font-bold tracking-[0.1em] text-red-100 whitespace-nowrap">{{ notificationText }}</span></div>
+      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-4 w-full justify-between min-w-0" :class="currentIslandMode === 'media' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'"><div class="w-8 h-8 rounded-full overflow-hidden border border-white/20 relative shrink-0"><img :src="player.currentTrack?.cover" class="w-full h-full object-cover animate-spin-slow" /></div><div class="flex flex-col justify-center flex-1 min-w-0 py-1 overflow-hidden"><span class="text-xs font-bold text-white leading-tight truncate text-left">{{ player.currentTrack?.title }}</span></div><div class="flex items-end gap-[2px] h-4 shrink-0 ml-auto"><div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-1" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div><div class="w-[2px] bg-starlight-purple rounded-full animate-wave-2" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div><div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-3" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div></div></div>
     </div>
 
-    <div class="absolute top-[-15%] right-[-10%] w-[600px] h-[600px] rounded-full pointer-events-none z-0 animate-float-slow opacity-70"
-         style="background: radial-gradient(circle at 30% 30%, rgba(189, 52, 254, 0.4) 0%, rgba(80, 20, 120, 0.1) 60%, transparent 100%); box-shadow: inset -20px -20px 50px rgba(0,0,0,0.5); filter: blur(40px);"></div>
-    <div class="absolute bottom-[-20%] left-[-15%] w-[700px] h-[700px] rounded-full pointer-events-none z-0 animate-float-slower opacity-60"
-         style="background: radial-gradient(circle at 70% 30%, rgba(100, 255, 218, 0.3) 0%, rgba(20, 120, 100, 0.05) 60%, transparent 100%); box-shadow: inset 20px 20px 50px rgba(0,0,0,0.5); filter: blur(50px);"></div>
+    <div class="absolute top-[-15%] right-[-10%] w-[600px] h-[600px] rounded-full pointer-events-none z-0 animate-float-slow opacity-70" style="background: radial-gradient(circle at 30% 30%, rgba(189, 52, 254, 0.4) 0%, rgba(80, 20, 120, 0.1) 60%, transparent 100%); box-shadow: inset -20px -20px 50px rgba(0,0,0,0.5); filter: blur(40px);"></div>
+    <div class="absolute bottom-[-20%] left-[-15%] w-[700px] h-[700px] rounded-full pointer-events-none z-0 animate-float-slower opacity-60" style="background: radial-gradient(circle at 70% 30%, rgba(100, 255, 218, 0.3) 0%, rgba(20, 120, 100, 0.05) 60%, transparent 100%); box-shadow: inset 20px 20px 50px rgba(0,0,0,0.5); filter: blur(50px);"></div>
     <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] opacity-20 mix-blend-overlay pointer-events-none z-0"></div>
 
     <div class="relative z-10 flex w-full h-full backdrop-blur-[1px]">
@@ -338,7 +259,6 @@ onMounted(() => {
                         <div class="relative group">
                             <div class="absolute inset-0 rounded-full border border-starlight-cyan/30 scale-110 opacity-0 group-hover:scale-125 group-hover:opacity-100 transition-all duration-700"></div>
                             <div class="absolute inset-0 rounded-full border border-starlight-purple/30 scale-105 animate-pulse"></div>
-                            
                             <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering && !player.isPaused ? 'running' : 'paused' }">
                                 <img :src="player.currentTrack?.cover || DEFAULT_COVER" class="w-full h-full object-cover opacity-90 select-none" />
                                 <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 bg-cosmos-950 rounded-full border border-white/10 flex items-center justify-center">
@@ -346,7 +266,6 @@ onMounted(() => {
                                 </div>
                             </div>
                         </div>
-
                         <div class="text-center space-y-2 z-10 mt-12 pointer-events-none">
                             <h1 class="text-4xl font-bold font-orbitron tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-white via-starlight-cyan to-white drop-shadow-lg">{{ player.currentTrack?.title || 'Unknown Track' }}</h1>
                             <p class="text-lg text-cosmos-300 font-light tracking-widest uppercase">{{ player.currentTrack?.artist || 'Unknown Artist' }}</p>
@@ -533,7 +452,7 @@ onMounted(() => {
             </div>
             <div class="flex items-center justify-end gap-3 w-1/3 group select-none">
               <button @click="toggleMute" class="outline-none no-drag-btn no-outline"><component :is="VolumeIcon" :size="20" class="text-white/60 hover:text-starlight-cyan transition-colors cursor-pointer"/></button>
-              <div class="relative w-24 h-4 flex items-center cursor-pointer no-drag-btn" @mousedown="startVolumeDrag"><div ref="volumeBarRef" class="w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none"><div class="h-full bg-starlight-cyan" :class="{ 'transition-[width] duration-150 ease-out': !isDraggingVol }" :style="{ width: player.volume + '%' }"></div></div><div class="absolute h-3 w-3 bg-white rounded-full shadow-[0_0_10px_white] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" :style="{ left: `calc(${player.volume}% - 6px)` }"></div></div>
+              <div class="relative w-24 h-4 flex items-center cursor-pointer no-drag-btn" @mousedown="startVolumeDrag"><div ref="volumeBarRef" class="w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none"><div class="h-full bg-starlight-cyan" :style="{ width: player.volume + '%' }"></div></div><div class="absolute h-3 w-3 bg-white rounded-full shadow-[0_0_10px_white] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" :style="{ left: `calc(${player.volume}% - 6px)` }"></div></div>
             </div>
           </div>
         </div>
@@ -579,6 +498,7 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 .slide-up-enter-from, .slide-up-leave-to { opacity: 0; transform: translateY(20px); filter: blur(5px); }
 
 .mask-gradient {
+  /* 扩大遮罩范围，显示更多上下文 */
   mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
   -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 85%, transparent 100%);
 }
@@ -590,15 +510,15 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 
 /* --- 酷狗级歌词核心样式 (Kugou Style) --- */
 .kugou-text {
-  /* 默认底色：冷白 (半透明度提升到 0.6) */
-  color: rgba(255, 255, 255, 0.6); 
+  /* 默认底色：冷白 (半透明度提升到 0.55，防止看不清) */
+  color: rgba(255, 255, 255, 0.55); 
   position: relative;
   z-index: 1;
 }
 
 /* 激活态：逐字填充 */
 .lyric-line.active .kugou-text {
-  /* 渐变：左侧高亮(亮白+青) -> 右侧透明 (透出下方的 ::after 底色) */
+  /* 渐变：左侧高亮(亮白) -> 右侧透明 (透出下方的 ::after 底色) */
   background-image: linear-gradient(to right, #ffffff var(--prog), transparent var(--prog));
   -webkit-background-clip: text;
   background-clip: text;
@@ -611,7 +531,7 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
   position: absolute;
   left: 0; top: 0;
   z-index: -1;
-  color: rgba(255, 255, 255, 0.6); 
+  color: rgba(255, 255, 255, 0.55); 
 }
 
 /* 聚焦效果 */
