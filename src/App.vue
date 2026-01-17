@@ -7,7 +7,8 @@ import {
   Play, Pause, SkipForward, SkipBack, ListMusic, Disc3, Settings, 
   Heart, Mic2, Shuffle, Repeat, Volume1, VolumeX, Volume2,
   Cpu, Zap, HardDrive, Film, CheckCircle2, Terminal, Loader2, AlertCircle,
-  Monitor, Sliders, LogOut, LayoutDashboard, ScanEye, Repeat1, AlertTriangle, PlusCircle, AudioLines, Speaker
+  Monitor, Sliders, LogOut, LayoutDashboard, ScanEye, Repeat1, AlertTriangle, PlusCircle, AudioLines, Speaker,
+  Activity
 } from 'lucide-vue-next';
 
 const player = usePlayerStore();
@@ -30,9 +31,8 @@ const notify = (text: string, type: 'info' | 'error' = 'info') => {
 
 const currentIslandMode = computed<IslandMode>(() => {
   if (isNotificationVisible.value) return isError.value ? 'error' : 'notification';
-  // 任何后台操作都显示 Loading
   if (player.isDragging || player.isSeeking || player.isBuffering) return 'loading'; 
-  if (player.isPlaying) return 'media';
+  if (player.isPlaying || player.currentTrack) return 'media';
   return 'idle';
 });
 
@@ -62,47 +62,35 @@ watch(showSettings, (v) => { if (v) notify('SYSTEM CONFIGURATION'); });
 const switchTab = (t: string) => { activeTab.value = t; showSettings.value = t === 'settings'; };
 const switchToMain = () => { showSettings.value = false; activeTab.value = 'dashboard'; };
 
-// --- 引擎设置 ---
+// --- 引擎设置 (视觉重构版) ---
 const activeSettingTab = ref('core');
-const engineStatus = ref('Ready');
-const statusType = ref<'idle' | 'loading' | 'success' | 'error'>('success');
-const engineLatency = ref<number>(0);
+const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
 
 const engines = [
-  { id: 'galaxy', name: 'GalaxyCore', sub: 'HYPERION', icon: Cpu, color: 'text-starlight-cyan', border: 'border-starlight-cyan', desc: 'Native Rust (RAM Accel)' },
-  { id: 'bass', name: 'BASS Audio', sub: 'AUDIOPHILE', icon: Zap, color: 'text-yellow-400', border: 'border-yellow-400', desc: 'Audiophile Grade' },
-  { id: 'mci', name: 'Windows MCI', sub: 'LEGACY', icon: HardDrive, color: 'text-blue-400', border: 'border-blue-400', desc: 'Legacy System' },
-  { id: 'ffmpeg', name: 'FFmpeg', sub: 'UNIVERSAL', icon: Film, color: 'text-purple-400', border: 'border-purple-400', desc: 'Universal Format' }
+  { id: 'galaxy', name: 'GalaxyCore', sub: 'HYPERION', icon: Cpu, color: 'text-starlight-cyan', border: 'border-starlight-cyan', glow: 'shadow-[0_0_15px_rgba(100,255,218,0.3)]', desc: 'Native Rust (Zero-Copy)' },
+  { id: 'bass', name: 'BASS Audio', sub: 'AUDIOPHILE', icon: Zap, color: 'text-yellow-400', border: 'border-yellow-400', glow: 'shadow-[0_0_15px_rgba(250,204,21,0.3)]', desc: 'Audiophile Grade' },
+  { id: 'mci', name: 'Windows MCI', sub: 'LEGACY', icon: HardDrive, color: 'text-blue-400', border: 'border-blue-400', glow: 'shadow-[0_0_15px_rgba(96,165,250,0.3)]', desc: 'Legacy System' },
+  { id: 'ffmpeg', name: 'FFmpeg', sub: 'UNIVERSAL', icon: Film, color: 'text-purple-400', border: 'border-purple-400', glow: 'shadow-[0_0_15px_rgba(192,132,252,0.3)]', desc: 'Universal Format' }
 ];
 
 const selectEngine = async (id: string) => {
-  if (statusType.value === 'loading' || player.activeEngine === id) return;
-  targetEngineId.value = id; 
-  statusType.value = 'loading';
-  engineStatus.value = `INITIALIZING ${id.toUpperCase()}...`;
-  notify(`SWITCHING TO ${id.toUpperCase()}...`);
+  if (engineState.value === 'switching' || player.activeEngine === id) return;
   
-  const startTime = performance.now();
+  targetEngineId.value = id; 
+  engineState.value = 'switching';
+  notify(`INITIALIZING ${id.toUpperCase()}...`);
+  
   const result = await player.switchEngine(id);
   
   if (result === true) {
-    statusType.value = 'success';
-    engineStatus.value = `${id.toUpperCase()} ONLINE`;
-    engineLatency.value = Math.round(performance.now() - startTime);
+    engineState.value = 'success';
     notify(`${id.toUpperCase()} ENGINE READY`);
-    targetEngineId.value = ''; 
+    setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500);
   } else {
-    statusType.value = 'error';
-    engineStatus.value = 'INIT FAILED';
+    engineState.value = 'failed';
     notify(`FAILED TO LOAD ${id.toUpperCase()}`, 'error');
-    setTimeout(() => {
-        if (targetEngineId.value === id) {
-            targetEngineId.value = '';
-            statusType.value = 'idle';
-            engineStatus.value = 'Ready';
-        }
-    }, 2000);
+    setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000);
   }
 };
 
@@ -116,26 +104,24 @@ const startVolumeDrag = (e: MouseEvent) => { isDraggingVol.value = true; updateV
 const onVolumeDrag = (e: MouseEvent) => { if(isDraggingVol.value) updateVolume(e); };
 const stopVolumeDrag = () => { isDraggingVol.value = false; window.removeEventListener('mousemove', onVolumeDrag); window.removeEventListener('mouseup', stopVolumeDrag); };
 
-// 🔥 修复：进度条“跟手”逻辑
-// 使用 localProgress 作为拖拽时的显示值，完全与 store 解耦
+// 🔥 进度条完全解耦逻辑
+// localProgress 仅在拖拽时使用，与 Store 断开
 const localProgress = ref(0);
 
-// 开始拖拽：仅标记状态，初始化本地值
 const onProgressInput = (e: Event) => {
     const target = e.target as HTMLInputElement;
     player.isDragging = true; 
     localProgress.value = parseFloat(target.value);
 };
 
-// 拖拽结束：提交 Seek，解除状态
 const onProgressChange = (e: Event) => {
     const target = e.target as HTMLInputElement;
     const val = parseFloat(target.value);
     
-    // 立即执行 Seek，Store 会处理 buffering 等待
+    // 立即发起 Seek，Store 负责处理 buffering 等待
     player.seekTo(val);
     
-    // 延迟解除 dragging 状态，防止进度条跳变回旧时间
+    // 延迟解锁 UI，防止 Seek 过程中进度条回弹
     setTimeout(() => {
         player.isDragging = false;
     }, 100);
@@ -159,6 +145,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
 
 <template>
   <main class="relative flex w-screen h-screen overflow-hidden text-cosmos-100 bg-[#05080a] font-sans rounded-xl border border-white/10">
+    
     <div 
       class="fixed top-[16.5px] left-1/2 -translate-x-1/2 z-[100] min-h-[40px] bg-black/10 backdrop-blur-md rounded-2xl border border-white/5 shadow-[0_4px_30px_rgba(0,0,0,0.1)] overflow-hidden transition-all duration-500 cubic-bezier(0.175, 0.885, 0.32, 1.275) pointer-events-none grid grid-cols-1 grid-rows-1 items-center justify-items-center"
       :class="[
@@ -187,7 +174,11 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-4 w-full justify-between" :class="currentIslandMode === 'media' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
         <div class="w-8 h-8 rounded-full overflow-hidden border border-white/20 relative shrink-0"><img :src="player.currentTrack?.cover" class="w-full h-full object-cover animate-spin-slow" /></div>
         <div class="flex flex-col justify-center flex-1 min-w-0 py-1"><span class="text-xs font-bold text-white leading-tight break-words truncate text-left">{{ player.currentTrack?.title }}</span></div>
-        <div class="flex items-end gap-[2px] h-4 shrink-0 ml-auto"><div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-1"></div><div class="w-[2px] bg-starlight-purple rounded-full animate-wave-2"></div><div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-3"></div></div>
+        <div class="flex items-end gap-[2px] h-4 shrink-0 ml-auto">
+            <div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-1" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
+            <div class="w-[2px] bg-starlight-purple rounded-full animate-wave-2" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
+            <div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-3" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
+        </div>
       </div>
     </div>
 
@@ -216,6 +207,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
         </header>
 
         <div class="flex-1 relative overflow-hidden w-full">
+          
           <div v-if="activeTab === 'likes'" class="absolute inset-0 z-20 flex flex-col p-10 overflow-y-auto scrollbar-hide">
              <h2 class="text-4xl font-bold font-orbitron text-white mb-8 flex items-center gap-4"><Heart :size="32" class="text-red-500 fill-red-500" /> LIKED TRACKS</h2>
              <div class="grid grid-cols-1 gap-2">
@@ -232,10 +224,10 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
               <div class="relative group">
                 <div class="absolute inset-0 rounded-full border border-starlight-cyan/30 scale-110 opacity-0 group-hover:scale-125 group-hover:opacity-100 transition-all duration-700"></div>
                 <div class="absolute inset-0 rounded-full border border-starlight-purple/30 scale-105 animate-pulse"></div>
-                <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering ? 'running' : 'paused' }">
+                <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering && !player.isPaused ? 'running' : 'paused' }">
                   <img :src="player.currentTrack?.cover || 'https://images.unsplash.com/photo-1614728853913-6591d801d643?q=80&w=400&auto=format&fit=crop'" class="w-full h-full object-cover opacity-90 select-none" />
                   <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 bg-cosmos-950 rounded-full border border-white/10 flex items-center justify-center">
-                    <div class="w-2 h-2 bg-starlight-cyan rounded-full" :class="{ 'animate-ping': player.isPlaying && !player.isBuffering }"></div>
+                    <div class="w-2 h-2 bg-starlight-cyan rounded-full" :class="{ 'animate-ping': player.isPlaying && !player.isBuffering && !player.isPaused }"></div>
                   </div>
                 </div>
               </div>
@@ -278,29 +270,41 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
               <div class="flex-1 h-full overflow-hidden p-10 relative z-10">
                 <Transition name="slide-fade" mode="out-in">
                   <div v-if="activeSettingTab === 'core'" class="h-full overflow-y-auto scrollbar-hide max-w-4xl mx-auto">
-                    <div class="mb-8">
-                      <h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3>
-                      <div class="mt-4 flex items-center gap-3 bg-black/40 p-3 rounded border border-white/5 w-fit"><span class="text-[10px] text-starlight-cyan/60 tracking-widest">STATUS:</span><span class="text-xs font-mono transition-colors duration-300" :class="{'text-green-400': statusType === 'success', 'text-yellow-400 animate-pulse': statusType === 'loading', 'text-red-500': statusType === 'error'}">[{{ engineStatus }}]</span></div>
-                    </div>
-                    <div class="grid grid-cols-2 gap-4">
-                      <div v-for="engine in engines" :key="engine.id" @click="selectEngine(engine.id)" class="relative p-5 rounded-xl border bg-cosmos-900/40 backdrop-blur-sm cursor-pointer transition-all duration-200 group hover:bg-white/5 no-drag-btn no-outline" 
-                      :class="[
-                        (targetEngineId === engine.id && statusType === 'error') ? 'border-red-500 bg-red-500/10' :
-                        (targetEngineId === engine.id && statusType === 'loading') ? 'border-yellow-400 bg-yellow-400/10' :
-                        (player.activeEngine === engine.id && (!targetEngineId || targetEngineId !== engine.id)) ? 'border-starlight-cyan bg-starlight-cyan/10' :
-                        'border-white/5 hover:border-white/20 bg-cosmos-900/40',
-                        
-                        (statusType === 'loading' && targetEngineId && targetEngineId !== engine.id) ? 'opacity-50 pointer-events-none' : 'opacity-100'
-                      ]">
-                        <div v-if="targetEngineId === engine.id || (targetEngineId === '' && player.activeEngine === engine.id)" class="absolute top-4 right-4">
-                            <Loader2 v-if="statusType === 'loading' && targetEngineId === engine.id" :size="18" class="text-yellow-400 animate-spin" />
-                            <AlertCircle v-else-if="statusType === 'error' && targetEngineId === engine.id" :size="18" class="text-red-500" />
-                            <CheckCircle2 v-else-if="player.activeEngine === engine.id && !targetEngineId" :size="18" class="text-starlight-cyan drop-shadow-[0_0_8px_cyan]" />
+                    <div class="mb-8 flex items-end justify-between">
+                        <div>
+                            <h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3>
+                            <p class="text-sm text-white/40">Select the audio core driver for signal processing.</p>
                         </div>
-                        <div class="mb-3 p-2 rounded-lg w-fit transition-colors bg-black/60"><component :is="engine.icon" :size="24" :class="player.activeEngine === engine.id || targetEngineId === engine.id ? engine.color : 'text-white/30'" /></div>
-                        <h4 class="text-base font-bold text-white mb-0.5">{{ engine.name }}</h4>
-                        <p class="text-[10px] font-mono mb-2 uppercase opacity-80" :class="engine.color">{{ engine.sub }}</p>
-                        <p class="text-xs text-white/40 leading-relaxed">{{ engine.desc }}</p>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                      <div v-for="engine in engines" :key="engine.id" @click="selectEngine(engine.id)" 
+                        class="relative p-5 rounded-xl border bg-cosmos-900/40 backdrop-blur-sm cursor-pointer transition-all duration-300 group hover:bg-white/5 no-drag-btn no-outline overflow-hidden" 
+                        :class="[
+                           (targetEngineId === engine.id && engineState === 'failed') ? 'border-red-500 bg-red-500/10' :
+                           (targetEngineId === engine.id && engineState === 'switching') ? 'border-yellow-400 bg-yellow-400/10' :
+                           (player.activeEngine === engine.id && engineState === 'idle') ? `bg-opacity-20 ${engine.border} ${engine.glow}` :
+                           'border-white/5 hover:border-white/20',
+                           (engineState === 'switching' && targetEngineId !== engine.id) ? 'opacity-50 grayscale' : 'opacity-100'
+                        ]">
+                        
+                        <div v-if="player.activeEngine === engine.id && engineState === 'idle'" class="absolute top-0 right-0 p-3">
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] font-bold tracking-widest" :class="engine.color">ACTIVE</span>
+                                <div class="w-2 h-2 rounded-full animate-pulse" :class="engine.color.replace('text-', 'bg-')"></div>
+                            </div>
+                        </div>
+
+                        <div v-if="targetEngineId === engine.id" class="absolute top-4 right-4">
+                            <Loader2 v-if="engineState === 'switching'" :size="18" class="text-yellow-400 animate-spin" />
+                            <AlertCircle v-else-if="engineState === 'failed'" :size="18" class="text-red-500" />
+                            <CheckCircle2 v-else-if="engineState === 'success'" :size="18" class="text-starlight-cyan drop-shadow-[0_0_8px_cyan]" />
+                        </div>
+
+                        <div class="mb-3 p-2 rounded-lg w-fit transition-colors bg-black/60 relative z-10"><component :is="engine.icon" :size="24" :class="player.activeEngine === engine.id || targetEngineId === engine.id ? engine.color : 'text-white/30'" /></div>
+                        <h4 class="text-base font-bold text-white mb-0.5 relative z-10">{{ engine.name }}</h4>
+                        <p class="text-[10px] font-mono mb-2 uppercase opacity-80 relative z-10" :class="engine.color">{{ engine.sub }}</p>
+                        <p class="text-xs text-white/40 leading-relaxed relative z-10">{{ engine.desc }}</p>
                       </div>
                     </div>
                   </div>
@@ -339,7 +343,6 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
                     @input="onProgressInput"
                     @change="onProgressChange"
                     class="w-full h-6 opacity-0 cursor-pointer z-10" />
-             
              <div class="absolute h-3 w-3 bg-white rounded-full shadow-[0_0_10px_white] pointer-events-none transition-opacity duration-200"
                   :class="player.isDragging ? 'opacity-100 scale-125' : 'opacity-0 group-hover:opacity-100'"
                   :style="{ left: `calc(${(player.isDragging ? localProgress : player.progress)}% - 6px)` }">
@@ -351,7 +354,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
             <div class="flex items-center gap-6">
               <button class="text-white/40 hover:text-white transition-colors no-drag-btn no-outline" @click="player.toggleMode"><Shuffle v-if="player.playMode === 'shuffle'" :size="20" class="text-starlight-cyan"/><Repeat1 v-else-if="player.playMode === 'loop'" :size="20" class="text-starlight-cyan"/><Repeat v-else :size="20"/></button>
               <button class="text-white hover:text-starlight-cyan transition-colors no-drag-btn no-outline" @click="player.prevTrack"><SkipBack :size="28" fill="currentColor"/></button>
-              <button @click="player.togglePlay" class="w-14 h-14 rounded-full bg-white text-cosmos-950 flex items-center justify-center hover:scale-110 active:scale-95 no-drag-btn no-outline"><Pause v-if="player.isPlaying" fill="currentColor"/><Play v-else fill="currentColor" class="ml-1"/></button>
+              <button @click="player.togglePlay" class="w-14 h-14 rounded-full bg-white text-cosmos-950 flex items-center justify-center hover:scale-110 active:scale-95 no-drag-btn no-outline"><Pause v-if="player.isPlaying && !player.isPaused" fill="currentColor"/><Play v-else fill="currentColor" class="ml-1"/></button>
               <button class="text-white hover:text-starlight-cyan transition-colors no-drag-btn no-outline" @click="player.nextTrack"><SkipForward :size="28" fill="currentColor"/></button>
               <button class="transition-colors no-drag-btn no-outline" :class="player.showPlaylist ? 'text-starlight-cyan' : 'text-white/40 hover:text-white'" @click="player.togglePlaylist"><ListMusic :size="20"/></button>
             </div>
@@ -367,7 +370,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
 </template>
 
 <style scoped>
-/* 保持原有样式不变 */
+/* Animations */
 .rotate-center { animation: rotate-record 10s linear infinite; }
 @keyframes rotate-record { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .animate-spin-slow { animation: spin 8s linear infinite; }

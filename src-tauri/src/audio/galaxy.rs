@@ -286,7 +286,7 @@ impl AudioEngine for GalaxyEngine {
                 let (lock, cvar) = &*self.decode_signal;
                 let mut finished = lock.lock().unwrap();
                 while !*finished && self.load_generation.load(Ordering::SeqCst) == current_gen {
-                    let result = cvar.wait_timeout(finished, Duration::from_secs(8)).unwrap();
+                    let result = cvar.wait_timeout(finished, Duration::from_secs(20)).unwrap();
                     finished = result.0;
                     if result.1.timed_out() { break; }
                 }
@@ -298,7 +298,6 @@ impl AudioEngine for GalaxyEngine {
 
         // 🔥🔥🔥 核心修复：Seek 时执行 Sink Swap 🔥🔥🔥
         // 这解决了“切换设备后 Seek 依然无声”的问题。
-        // 因为旧的 Sink 绑定在旧设备上，必须新建一个 Sink 才能输出到新设备。
         debug_log!("Creating NEW Sink for Seek...");
         let new_sink_result = Sink::try_new(&self.stream_handle);
 
@@ -311,7 +310,7 @@ impl AudioEngine for GalaxyEngine {
             sink_guard.clear();
         }
         
-        // 恢复播放状态（除非用户明确暂停了，但通常 Seek 后期望听到声音）
+        // 恢复播放状态
         sink_guard.play(); 
         sink_guard.set_volume(self.get_volume());
 
