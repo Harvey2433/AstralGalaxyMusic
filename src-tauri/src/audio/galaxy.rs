@@ -1,13 +1,27 @@
 use super::AudioEngine;
-use rodio::{Decoder, OutputStreamHandle, Sink, Source};
-use rodio::buffer::SamplesBuffer;
+use rodio::{Decoder, OutputStreamHandle, Sink, Source, Sample};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
-use std::sync::{Arc, RwLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, RwLock, Mutex, Condvar};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use std::thread;
+use std::panic;
+use std::mem;
 
-// 声道模式
+// --- 日志宏 ---
+macro_rules! debug_log {
+    ($($arg:tt)*) => ({
+        let thread_id = format!("{:?}", thread::current().id()).replace("ThreadId(", "").replace(")", "");
+        println!("\x1b[36m[GALAXY][T:{}] {}\x1b[0m", thread_id, format!($($arg)*));
+    })
+}
+macro_rules! error_log {
+    ($($arg:tt)*) => ({
+        println!("\x1b[31m[GALAXY-ERR] {}\x1b[0m", format!($($arg)*));
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChannelConfig {
     Stereo = 2,
@@ -15,15 +29,111 @@ pub enum ChannelConfig {
     Surround71 = 8,
 }
 
+// --- 核心组件：零拷贝内存源 (Memory Iterator) ---
+// 替代 from_iter，解决编译错误并提升性能，避免大内存分配
+#[derive(Clone)]
+pub struct MemorySource {
+    data: Arc<Vec<f32>>, // 持有 Arc，轻量级克隆
+    pos: usize,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl MemorySource {
+    pub fn new(data: Arc<Vec<f32>>, offset: usize, channels: u16, sample_rate: u32) -> Self {
+        Self { data, pos: offset, channels, sample_rate }
+    }
+}
+
+impl Iterator for MemorySource {
+    type Item = f32;
+    #[inline]
+    fn next(&mut self) -> Option<f32> {
+        if self.pos < self.data.len() {
+            let v = self.data[self.pos];
+            self.pos += 1;
+            Some(v)
+        } else {
+            None
+        }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.data.len().saturating_sub(self.pos);
+        (rem, Some(rem))
+    }
+}
+
+impl Source for MemorySource {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { self.channels }
+    fn sample_rate(&self) -> u32 { self.sample_rate }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
+// --- 核心组件：实时上混源 (Upmix Iterator) ---
+// 随播随算，不分配大内存，解决高频卡顿
+pub struct UpmixSource<I: Source<Item = f32>> {
+    input: I,
+    target_channels: u16,
+    current_frame: Vec<f32>,
+}
+
+impl<I: Source<Item = f32>> UpmixSource<I> {
+    pub fn new(input: I, target_channels: u16) -> Self {
+        Self { input, target_channels, current_frame: Vec::with_capacity(8) }
+    }
+}
+
+impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.input.channels() != 2 || self.target_channels == 2 {
+            return self.input.next();
+        }
+        if self.current_frame.is_empty() {
+            let l = self.input.next()?;
+            let r = self.input.next()?;
+            let c = (l + r) * 0.5;
+            let lfe = (l + r) * 0.1;
+            
+            // 填充帧缓冲区 (L, R, C, LFE, RL, RR, ...)
+            self.current_frame.push(l); 
+            self.current_frame.push(r); 
+            self.current_frame.push(c); 
+            self.current_frame.push(lfe);
+            self.current_frame.push(l * 0.8); 
+            self.current_frame.push(r * 0.8);
+            
+            if self.target_channels == 8 {
+                self.current_frame.push(l * 0.6); 
+                self.current_frame.push(r * 0.6);
+            }
+            self.current_frame.reverse(); //以便 pop
+        }
+        self.current_frame.pop()
+    }
+}
+
+impl<I: Source<Item = f32>> Source for UpmixSource<I> {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { self.target_channels }
+    fn sample_rate(&self) -> u32 { self.input.sample_rate() }
+    fn total_duration(&self) -> Option<Duration> { self.input.total_duration() }
+}
+
+// --- Galaxy Engine ---
+
 pub struct GalaxyEngine {
     sink: Arc<Mutex<Sink>>,
     stream_handle: OutputStreamHandle,
     raw_bytes: Option<Arc<Vec<u8>>>,
-    pcm_cache: Arc<RwLock<Option<Arc<Vec<f32>>>>>, // 缓存 PCM 数据用于快速 Seek
+    pcm_cache: Arc<RwLock<Option<Arc<Vec<f32>>>>>,
     sample_rate: u32,
     channels: u16,
     current_volume: Arc<RwLock<f32>>,
     channel_mode: Arc<RwLock<ChannelConfig>>,
+    load_generation: Arc<AtomicUsize>, 
+    decode_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl GalaxyEngine {
@@ -38,6 +148,8 @@ impl GalaxyEngine {
             channels: 2,
             current_volume: Arc::new(RwLock::new(1.0)),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
+            load_generation: Arc::new(AtomicUsize::new(0)),
+            decode_signal: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
@@ -48,191 +160,211 @@ impl GalaxyEngine {
 
     fn get_volume(&self) -> f32 { *self.current_volume.read().unwrap() }
 
-    // 声道上混算法
-    fn upmix_samples(samples: &[f32], src_channels: u16, target_mode: ChannelConfig) -> Vec<f32> {
-        if src_channels != 2 { return samples.to_vec(); }
-        
-        let target_channels = target_mode as u16;
-        if target_channels == 2 { return samples.to_vec(); }
-
-        let mut output = Vec::with_capacity(samples.len() / 2 * target_channels as usize);
-        
-        for chunk in samples.chunks(2) {
-            if chunk.len() < 2 { break; }
-            let l = chunk[0];
-            let r = chunk[1];
-            
-            let center = (l + r) * 0.5;
-            let lfe = (l + r) * 0.1;
-            
-            // 5.1 / 7.1 mapping
-            output.push(l); 
-            output.push(r);
-            output.push(center);
-            output.push(lfe);
-            output.push(l * 0.8);
-            output.push(r * 0.8);
-            
-            if target_channels == 8 {
-                output.push(l * 0.6);
-                output.push(r * 0.6);
-            }
-        }
-        output
+    // 后台销毁 Sink，防止死锁
+    fn drop_sink_in_background(sink: Sink) {
+        thread::spawn(move || { drop(sink); });
     }
 }
 
 impl AudioEngine for GalaxyEngine {
-    fn name(&self) -> &str { "Galaxy Hybrid (Surround+)" }
+    fn name(&self) -> &str { "Galaxy Hybrid (Ultimate)" }
 
     fn update_output_stream(&mut self, handle: OutputStreamHandle) {
         self.stream_handle = handle;
     }
 
     fn load(&mut self, path: &str) -> Result<f64, String> {
-        // 1. 停止当前播放并清空缓冲
-        {
-            let sink = self.sink.lock().unwrap();
-            sink.stop();
-            sink.clear(); // 必须调用 clear，否则 Rodio 会把残余数据播完
-        }
-        
-        // 短暂等待资源释放
-        thread::sleep(Duration::from_millis(10));
+        // 1. 切歌代数自增 (熔断机制)
+        let current_gen = self.load_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        debug_log!(">>> LOAD START: Gen={}, Path={}", current_gen, path);
 
+        // 2. 重置信号量
+        {
+            let (lock, _) = &*self.decode_signal;
+            let mut finished = lock.lock().unwrap();
+            *finished = false;
+        }
+
+        // 3. 异步文件读取
+        let start_read = Instant::now();
         let file = File::open(path).map_err(|e| e.to_string())?;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
-        let len = metadata.len();
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::with_capacity(len as usize);
         reader.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
         let raw_bytes = Arc::new(buffer);
+        debug_log!("File read in {:?}", start_read.elapsed());
 
         let source = Self::create_decoder(&raw_bytes)?;
         self.sample_rate = source.sample_rate();
         self.channels = source.channels();
         let total_duration = source.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
+        // 4. 重建 Sink & 播放
+        // 提前创建 Sink (不占锁)
+        let new_sink_result = Sink::try_new(&self.stream_handle);
+        
         {
-            let mut sink = self.sink.lock().unwrap();
-            // 尝试基于最新句柄重建 Sink (确保设备切换生效)
-            if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
-                *sink = new_sink;
+            let mut sink_guard = self.sink.lock().unwrap();
+            
+            // 安全交换 (Safe Swap)
+            if let Ok(new_sink) = new_sink_result {
+                let old_sink = mem::replace(&mut *sink_guard, new_sink);
+                Self::drop_sink_in_background(old_sink);
             } else {
-                sink.clear(); // 重建失败则清空旧的
+                sink_guard.clear();
             }
-            sink.set_volume(self.get_volume());
-            sink.append(source);
-            sink.play(); // 默认自动播放，或者由前端控制 pause
+            
+            sink_guard.set_volume(self.get_volume());
+            
+            // 准备播放管道
+            let target_mode = *self.channel_mode.read().unwrap();
+            let target_channels = target_mode as u16;
+            
+            // 🔥 核心优化：buffered() 抵抗 CPU 波动
+            let buffered_source = source.convert_samples::<f32>().buffered();
+            let mixed_source = UpmixSource::new(buffered_source, target_channels);
+            
+            sink_guard.append(mixed_source);
+            sink_guard.play();
         }
 
         self.raw_bytes = Some(raw_bytes.clone());
         
-        // 🔥 核心并发修复：
-        // 创建一个新的 Arc<RwLock> 替换掉 self.pcm_cache。
-        // 这样，上一首歌曲未完成的后台解码线程持有的是旧的 Arc，它写入的数据
-        // 将被写入到这一“废弃”的内存区域，而不会污染当前 self.pcm_cache。
-        // 这彻底解决了“切歌后Seek，由于旧线程晚于新线程完成，导致缓存被覆盖为旧歌数据”的Bug。
+        // 5. 启动后台解码
         self.pcm_cache = Arc::new(RwLock::new(None));
-
         let pcm_cache_ref = self.pcm_cache.clone();
         let raw_bytes_clone = raw_bytes.clone();
-        
-        // 后台解码线程
+        let generation_ref = self.load_generation.clone();
+        let signal_ref = self.decode_signal.clone();
+        let signal_ref_err = self.decode_signal.clone();
+
         thread::spawn(move || {
-            if let Ok(decoder) = Self::create_decoder(&raw_bytes_clone) {
-                // 这是一个耗时操作
-                let samples: Vec<f32> = decoder.convert_samples().collect();
-                
-                // 解码完成后，获取写锁并写入
-                if let Ok(mut cache) = pcm_cache_ref.write() {
-                    *cache = Some(Arc::new(samples));
+            let result = panic::catch_unwind(move || {
+                if let Ok(decoder) = Self::create_decoder(&raw_bytes_clone) {
+                    let samples: Vec<f32> = decoder.convert_samples().collect();
+                    
+                    // 只有当这一代还没过期时才写入
+                    if generation_ref.load(Ordering::SeqCst) == current_gen {
+                        if let Ok(mut cache) = pcm_cache_ref.write() {
+                            *cache = Some(Arc::new(samples));
+                            debug_log!("Cache ready for Gen={}", current_gen);
+                        }
+                    }
                 }
+                // 通知 Seek 线程解锁
+                let (lock, cvar) = &*signal_ref;
+                let mut finished = lock.lock().unwrap();
+                *finished = true;
+                cvar.notify_all();
+            });
+
+            if let Err(_) = result {
+                error_log!("Decoder Panic!");
+                // 即使 Panic 也要解锁
+                let (lock, cvar) = &*signal_ref_err;
+                let mut finished = lock.lock().unwrap();
+                *finished = true;
+                cvar.notify_all();
             }
         });
 
         Ok(total_duration)
     }
 
-    fn play(&mut self) {
-        let sink = self.sink.clone();
-        let vol = self.get_volume();
-        thread::spawn(move || {
-            if let Ok(s) = sink.lock() { s.play(); }
-            // 简单的淡入防止爆音
-            if let Ok(s) = sink.lock() { s.set_volume(0.0); }
-            for i in 1..=10 {
-                thread::sleep(Duration::from_millis(15));
-                if let Ok(s) = sink.lock() { s.set_volume(vol * (i as f32 / 10.0)); }
-            }
-        });
-    }
-
-    fn pause(&mut self) {
-        let sink = self.sink.clone();
-        let start_vol = self.get_volume();
-        thread::spawn(move || {
-            // 淡出
-            for i in 0..10 {
-                thread::sleep(Duration::from_millis(15));
-                if let Ok(s) = sink.lock() { s.set_volume(start_vol * (1.0 - i as f32 / 10.0)); }
-            }
-            if let Ok(s) = sink.lock() { s.pause(); s.set_volume(start_vol); }
-        });
-    }
+    fn play(&mut self) { if let Ok(s) = self.sink.lock() { s.play(); } }
+    fn pause(&mut self) { if let Ok(s) = self.sink.lock() { s.pause(); } }
 
     fn seek(&mut self, time: f64) {
-        // 先获取 sink 锁
-        let mut sink = self.sink.lock().unwrap();
-        
-        // 🔥 核心修复：Sink 被替换或追加前必须清空！
-        // Rodio 的 append 是追加模式。如果不 clear，Seek 后的音频会排在当前播放缓冲的后面。
-        // Drop 旧 sink 时若未 clear，旧 sink 的余音也会继续播放。
-        sink.clear();
+        let current_gen = self.load_generation.load(Ordering::SeqCst);
+        debug_log!("SEEK: {}s", time);
 
-        let is_paused = sink.is_paused();
-        
-        // 尝试重建 sink，以防输出设备在播放中途改变了但未应用
-        if let Ok(new_sink) = Sink::try_new(&self.stream_handle) { 
-            *sink = new_sink; 
+        // 1. 等待 PCM 缓存 (最大 8s)
+        {
+            let has_cache = self.pcm_cache.read().unwrap().is_some();
+            if !has_cache {
+                let (lock, cvar) = &*self.decode_signal;
+                let mut finished = lock.lock().unwrap();
+                while !*finished && self.load_generation.load(Ordering::SeqCst) == current_gen {
+                    let result = cvar.wait_timeout(finished, Duration::from_secs(8)).unwrap();
+                    finished = result.0;
+                    if result.1.timed_out() { break; }
+                }
+            }
         }
-        // 设置回音量（新 sink 默认音量是 1.0）
-        sink.set_volume(self.get_volume());
 
-        // 读取缓存锁
+        // 切歌检查
+        if self.load_generation.load(Ordering::SeqCst) != current_gen { return; }
+
+        // 🔥🔥🔥 核心修复：Seek 时执行 Sink Swap 🔥🔥🔥
+        // 这解决了“切换设备后 Seek 依然无声”的问题。
+        // 因为旧的 Sink 绑定在旧设备上，必须新建一个 Sink 才能输出到新设备。
+        debug_log!("Creating NEW Sink for Seek...");
+        let new_sink_result = Sink::try_new(&self.stream_handle);
+
+        let mut sink_guard = self.sink.lock().unwrap();
+        
+        if let Ok(new_sink) = new_sink_result {
+            let old_sink = mem::replace(&mut *sink_guard, new_sink);
+            Self::drop_sink_in_background(old_sink);
+        } else {
+            sink_guard.clear();
+        }
+        
+        // 恢复播放状态（除非用户明确暂停了，但通常 Seek 后期望听到声音）
+        sink_guard.play(); 
+        sink_guard.set_volume(self.get_volume());
+
         let cache = self.pcm_cache.read().unwrap();
         let mode = *self.channel_mode.read().unwrap();
+        let target_channels = match mode {
+            ChannelConfig::Stereo => 2,
+            ChannelConfig::Surround51 => 6,
+            ChannelConfig::Surround71 => 8,
+        };
 
+        let mut appended = false;
+
+        // 2. Memory Seek (极速)
         if let Some(samples) = &*cache {
-            // 有缓存：内存级 Seek (极速)
             let offset = (time * self.sample_rate as f64 * self.channels as f64) as usize;
-            if offset < samples.len() {
-                let slice = &samples[offset..];
-                
-                let final_samples = if self.channels == 2 && mode != ChannelConfig::Stereo {
-                    Self::upmix_samples(slice, self.channels, mode)
-                } else {
-                    slice.to_vec()
-                };
-                
-                let target_channels = if self.channels == 2 && mode != ChannelConfig::Stereo {
-                    mode as u16
-                } else {
-                    self.channels
-                };
+            let align = self.channels as usize;
+            let aligned_offset = offset - (offset % align);
 
-                let buffer = SamplesBuffer::new(target_channels, self.sample_rate, final_samples);
-                sink.append(buffer);
+            if aligned_offset < samples.len() {
+                let source = MemorySource::new(
+                    Arc::clone(samples), 
+                    aligned_offset, 
+                    self.channels, 
+                    self.sample_rate
+                );
+                // 内存源也加 Buffered，平滑数据流
+                let mixed = UpmixSource::new(source.buffered(), target_channels);
+                sink_guard.append(mixed);
+                appended = true;
+                debug_log!("Mem Seek OK");
             }
-        } else if let Some(data) = &self.raw_bytes {
-            // 无缓存：IO Seek (回退方案)
-            if let Ok(mut src) = Self::create_decoder(data) {
-                let _ = src.try_seek(Duration::from_secs_f64(time));
-                sink.append(src);
+        } 
+        
+        // 3. IO Seek Fallback
+        if !appended {
+            debug_log!("IO Seek...");
+            if let Some(data) = &self.raw_bytes {
+                if let Ok(mut src) = Self::create_decoder(data) {
+                    if src.try_seek(Duration::from_secs_f64(time)).is_ok() {
+                        let stream = src.convert_samples::<f32>().buffered();
+                        let mixed = UpmixSource::new(stream, target_channels);
+                        sink_guard.append(mixed);
+                    } else {
+                        // 失败则暂停，防止从头播放
+                        error_log!("IO Seek Failed.");
+                        sink_guard.pause(); 
+                    }
+                }
             }
         }
         
-        if is_paused { sink.pause(); } else { sink.play(); }
+        sink_guard.play();
     }
 
     fn set_volume(&mut self, vol: f32) {
@@ -240,11 +372,9 @@ impl AudioEngine for GalaxyEngine {
         if let Ok(s) = self.sink.lock() { s.set_volume(vol); }
     }
 
-    fn set_channel_mode(&mut self, mode: u16) {
-        let config = match mode {
-            6 => ChannelConfig::Surround51,
-            8 => ChannelConfig::Surround71,
-            _ => ChannelConfig::Stereo,
+    fn set_channel_mode(&mut self, _mode: u16) {
+        let config = match _mode {
+            6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, _ => ChannelConfig::Stereo,
         };
         *self.channel_mode.write().unwrap() = config;
     }

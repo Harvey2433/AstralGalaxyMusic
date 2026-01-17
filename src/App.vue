@@ -30,17 +30,17 @@ const notify = (text: string, type: 'info' | 'error' = 'info') => {
 
 const currentIslandMode = computed<IslandMode>(() => {
   if (isNotificationVisible.value) return isError.value ? 'error' : 'notification';
-  // 修复：将 isSeeking 也纳入 Loading 状态显示，给用户反馈
-  if (player.isDragging || player.isSeeking) return 'loading'; 
+  // 任何后台操作都显示 Loading
+  if (player.isDragging || player.isSeeking || player.isBuffering) return 'loading'; 
   if (player.isPlaying) return 'media';
   return 'idle';
 });
 
-// --- 声道与设备控制 ---
+// --- 声道与设备 ---
 const currentChannel = ref(2);
 const setChannel = (ch: number) => {
   currentChannel.value = ch;
-  player.setChannelMode(ch); 
+  player.setChannelMode(ch);
   notify(`AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`);
 };
 
@@ -62,12 +62,12 @@ watch(showSettings, (v) => { if (v) notify('SYSTEM CONFIGURATION'); });
 const switchTab = (t: string) => { activeTab.value = t; showSettings.value = t === 'settings'; };
 const switchToMain = () => { showSettings.value = false; activeTab.value = 'dashboard'; };
 
-// --- 引擎 ---
+// --- 引擎设置 ---
 const activeSettingTab = ref('core');
 const engineStatus = ref('Ready');
 const statusType = ref<'idle' | 'loading' | 'success' | 'error'>('success');
 const engineLatency = ref<number>(0);
-const targetEngineId = ref(''); // 正在尝试初始化的引擎 ID
+const targetEngineId = ref(''); 
 
 const engines = [
   { id: 'galaxy', name: 'GalaxyCore', sub: 'HYPERION', icon: Cpu, color: 'text-starlight-cyan', border: 'border-starlight-cyan', desc: 'Native Rust (RAM Accel)' },
@@ -78,7 +78,6 @@ const engines = [
 
 const selectEngine = async (id: string) => {
   if (statusType.value === 'loading' || player.activeEngine === id) return;
-  
   targetEngineId.value = id; 
   statusType.value = 'loading';
   engineStatus.value = `INITIALIZING ${id.toUpperCase()}...`;
@@ -92,12 +91,11 @@ const selectEngine = async (id: string) => {
     engineStatus.value = `${id.toUpperCase()} ONLINE`;
     engineLatency.value = Math.round(performance.now() - startTime);
     notify(`${id.toUpperCase()} ENGINE READY`);
-    targetEngineId.value = ''; // 成功，清除目标，UI回退到 activeEngine 渲染
+    targetEngineId.value = ''; 
   } else {
     statusType.value = 'error';
     engineStatus.value = 'INIT FAILED';
     notify(`FAILED TO LOAD ${id.toUpperCase()}`, 'error');
-    // 修复：失败2秒后自动复位状态，消除“双重选中”的UI残留
     setTimeout(() => {
         if (targetEngineId.value === id) {
             targetEngineId.value = '';
@@ -108,9 +106,8 @@ const selectEngine = async (id: string) => {
   }
 };
 
-// --- 控制 ---
+// --- 控制与交互 ---
 const volumeBarRef = ref<HTMLElement | null>(null);
-const progressBarRef = ref<HTMLElement | null>(null);
 const isDraggingVol = ref(false);
 const VolumeIcon = computed(() => { if(player.volume===0)return VolumeX; if(player.volume<50)return Volume1; return Volume2; });
 
@@ -119,31 +116,31 @@ const startVolumeDrag = (e: MouseEvent) => { isDraggingVol.value = true; updateV
 const onVolumeDrag = (e: MouseEvent) => { if(isDraggingVol.value) updateVolume(e); };
 const stopVolumeDrag = () => { isDraggingVol.value = false; window.removeEventListener('mousemove', onVolumeDrag); window.removeEventListener('mouseup', stopVolumeDrag); };
 
-const isDraggingProg = ref(false);
+// 🔥 修复：进度条“跟手”逻辑
+// 使用 localProgress 作为拖拽时的显示值，完全与 store 解耦
 const localProgress = ref(0);
-const calculateProgress = (e: MouseEvent): number => {
-  if (!progressBarRef.value) return 0;
-  const rect = progressBarRef.value.getBoundingClientRect();
-  return Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+
+// 开始拖拽：仅标记状态，初始化本地值
+const onProgressInput = (e: Event) => {
+    const target = e.target as HTMLInputElement;
+    player.isDragging = true; 
+    localProgress.value = parseFloat(target.value);
 };
-const startProgressDrag = (e: MouseEvent) => { 
-  player.isDragging = true; 
-  isDraggingProg.value = true; 
-  localProgress.value = calculateProgress(e); 
-  window.addEventListener('mousemove', onProgressDrag); 
-  window.addEventListener('mouseup', stopProgressDrag); 
+
+// 拖拽结束：提交 Seek，解除状态
+const onProgressChange = (e: Event) => {
+    const target = e.target as HTMLInputElement;
+    const val = parseFloat(target.value);
+    
+    // 立即执行 Seek，Store 会处理 buffering 等待
+    player.seekTo(val);
+    
+    // 延迟解除 dragging 状态，防止进度条跳变回旧时间
+    setTimeout(() => {
+        player.isDragging = false;
+    }, 100);
 };
-const onProgressDrag = (e: MouseEvent) => { if (isDraggingProg.value) localProgress.value = calculateProgress(e); };
-const stopProgressDrag = (e: MouseEvent) => { 
-  if (!isDraggingProg.value) return;
-  isDraggingProg.value = false; 
-  const finalPercent = calculateProgress(e);
-  // 修复：无论何时松开鼠标，都尝试 seek，不依赖 buffering 状态
-  player.seekTo(finalPercent);
-  setTimeout(() => { player.isDragging = false; }, 100); 
-  window.removeEventListener('mousemove', onProgressDrag); 
-  window.removeEventListener('mouseup', stopProgressDrag); 
-};
+
 const toggleMute = () => { player.volume = player.volume > 0 ? 0 : 50; };
 
 // --- 动画 ---
@@ -162,7 +159,6 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
 
 <template>
   <main class="relative flex w-screen h-screen overflow-hidden text-cosmos-100 bg-[#05080a] font-sans rounded-xl border border-white/10">
-    
     <div 
       class="fixed top-[16.5px] left-1/2 -translate-x-1/2 z-[100] min-h-[40px] bg-black/10 backdrop-blur-md rounded-2xl border border-white/5 shadow-[0_4px_30px_rgba(0,0,0,0.1)] overflow-hidden transition-all duration-500 cubic-bezier(0.175, 0.885, 0.32, 1.275) pointer-events-none grid grid-cols-1 grid-rows-1 items-center justify-items-center"
       :class="[
@@ -175,7 +171,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
       
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'loading' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
         <Loader2 :size="16" class="text-starlight-cyan animate-spin shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">SEEKING...</span>
+        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">PROCESSING...</span>
       </div>
 
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'notification' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
@@ -220,7 +216,6 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
         </header>
 
         <div class="flex-1 relative overflow-hidden w-full">
-          
           <div v-if="activeTab === 'likes'" class="absolute inset-0 z-20 flex flex-col p-10 overflow-y-auto scrollbar-hide">
              <h2 class="text-4xl font-bold font-orbitron text-white mb-8 flex items-center gap-4"><Heart :size="32" class="text-red-500 fill-red-500" /> LIKED TRACKS</h2>
              <div class="grid grid-cols-1 gap-2">
@@ -250,12 +245,14 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
                 </div>
           </div>
 
-          <div v-if="player.showPlaylist" class="fixed inset-0 z-20" @click="player.togglePlaylist"></div>
           <Transition name="slide-right">
-            <div v-if="player.showPlaylist" class="absolute top-0 right-0 bottom-0 w-80 bg-cosmos-950/90 backdrop-blur-xl border-l border-white/10 z-30 flex flex-col shadow-2xl" @click.stop>
-              <div class="p-4 border-b border-white/5 flex justify-between items-center"><h3 class="font-orbitron text-white text-sm tracking-widest">PLAYLIST</h3><span class="text-xs text-starlight-cyan font-mono">{{ player.queue.length }} TRACKS</span></div>
+            <div v-if="player.showPlaylist" class="absolute top-0 right-0 bottom-0 w-80 bg-cosmos-950/95 backdrop-blur-xl border-l border-white/10 z-40 flex flex-col shadow-2xl">
+              <div class="p-4 border-b border-white/5 flex justify-between items-center bg-black/20">
+                  <h3 class="font-orbitron text-white text-sm tracking-widest">PLAYLIST</h3>
+                  <button @click="player.togglePlaylist" class="text-white/50 hover:text-white transition-colors no-outline">✕</button>
+              </div>
               <div class="flex-1 overflow-y-auto scrollbar-hide p-2">
-                <div v-for="(track, index) in player.queue" :key="track.id" @dblclick="player.currentIndex = index; player.loadAndPlay()" class="flex items-center gap-3 p-3 rounded-lg cursor-pointer group border-b border-white/5 transition-all mb-1 hover:bg-white/5">
+                <div v-for="(track, index) in player.queue" :key="track.id" @dblclick="player.playTrack(track)" class="flex items-center gap-3 p-3 rounded-lg cursor-pointer group border-b border-white/5 transition-all mb-1 hover:bg-white/5">
                   <img :src="track.cover" class="w-8 h-8 rounded object-cover opacity-80" />
                   <div class="flex-1 min-w-0"><div class="text-white font-bold text-xs truncate" :class="player.currentIndex === index ? 'text-starlight-cyan' : ''">{{ track.title }}</div><div class="text-white/40 text-[10px] truncate">{{ track.artist }}</div></div>
                   <button @click.stop="player.toggleLike(track)" class="opacity-0 group-hover:opacity-100 transition-opacity text-white/50 hover:text-red-500 mr-2"><Heart :size="14" :class="{ 'fill-red-500 text-red-500 opacity-100': player.isLiked(track) }" /></button>
@@ -329,15 +326,26 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
         </div>
         
         <div class="h-28 px-8 pb-4 bg-gradient-to-t from-cosmos-950 via-cosmos-900/90 to-transparent flex flex-col justify-end relative z-40">
-          <div class="w-full h-6 mb-4 flex items-center cursor-default group relative no-drag-btn" @mousedown="startProgressDrag" ref="progressBarRef">
-            <div class="w-full h-1 bg-white/10 rounded-full overflow-hidden relative pointer-events-none">
-              <div class="absolute h-full rounded-full group-hover:h-2 transition-all top-1/2 -translate-y-1/2" 
-                   :class="player.isBuffering ? 'bg-starlight-purple animate-pulse' : 'bg-gradient-to-r from-starlight-purple to-starlight-cyan'"
-                   :style="{ width: (isDraggingProg ? localProgress : player.progress) + '%' }">
-                <div class="absolute right-0 top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full shadow-[0_0_10px_white] opacity-0 group-hover:opacity-100 transition-opacity"></div>
-              </div>
-            </div>
+          
+          <div class="w-full h-6 mb-4 flex items-center cursor-default group relative no-drag-btn">
+             <div class="absolute w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none">
+                <div class="absolute h-full top-0 left-0 bg-gradient-to-r from-starlight-purple to-starlight-cyan transition-all duration-100"
+                     :class="player.isBuffering ? 'animate-pulse opacity-50' : ''"
+                     :style="{ width: (player.isDragging ? localProgress : player.progress) + '%' }">
+                </div>
+             </div>
+             <input type="range" min="0" max="100" step="0.1"
+                    :value="player.isDragging ? localProgress : player.progress"
+                    @input="onProgressInput"
+                    @change="onProgressChange"
+                    class="w-full h-6 opacity-0 cursor-pointer z-10" />
+             
+             <div class="absolute h-3 w-3 bg-white rounded-full shadow-[0_0_10px_white] pointer-events-none transition-opacity duration-200"
+                  :class="player.isDragging ? 'opacity-100 scale-125' : 'opacity-0 group-hover:opacity-100'"
+                  :style="{ left: `calc(${(player.isDragging ? localProgress : player.progress)}% - 6px)` }">
+             </div>
           </div>
+
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-4 w-1/3"><div class="w-12 h-12 rounded bg-white/5 border border-white/10 flex items-center justify-center"><Disc3 class="text-white/20" /></div><div class="text-sm"><div class="text-white max-w-[150px] truncate">{{ player.currentTrack?.title || 'No Track' }}</div><div class="text-xs text-white/40">{{ player.currentTrack?.artist || 'Unknown' }}</div></div></div>
             <div class="flex items-center gap-6">
@@ -359,6 +367,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
 </template>
 
 <style scoped>
+/* 保持原有样式不变 */
 .rotate-center { animation: rotate-record 10s linear infinite; }
 @keyframes rotate-record { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .animate-spin-slow { animation: spin 8s linear infinite; }
