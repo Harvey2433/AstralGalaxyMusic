@@ -39,3 +39,4 @@ target/
 .vscode
 .idea
 *.swp
+*.cmd
