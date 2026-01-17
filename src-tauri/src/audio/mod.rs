@@ -1,10 +1,13 @@
+// src/audio/mod.rs
+
 pub mod galaxy;
 pub mod ffmpeg;
+pub mod dsp; // 🔥 必须添加这一行，否则 galaxy.rs 找不到 dsp
 
 use rodio::{OutputStream, OutputStreamHandle};
 use rodio::cpal::traits::{HostTrait, DeviceTrait};
 
-// 🔥 核心修复：Wrapper 强制实现 Send/Sync
+// Wrapper 强制实现 Send/Sync
 struct StreamHolder(OutputStream);
 unsafe impl Send for StreamHolder {}
 unsafe impl Sync for StreamHolder {}
@@ -22,7 +25,6 @@ pub trait AudioEngine: Send + Sync {
 
 pub struct AudioManager {
     active_engine: Box<dyn AudioEngine>,
-    // 使用包装后的流
     _stream: Option<StreamHolder>, 
     stream_handle: OutputStreamHandle,
 }
@@ -30,6 +32,7 @@ pub struct AudioManager {
 impl AudioManager {
     pub fn new() -> Self {
         let (stream, stream_handle) = OutputStream::try_default().unwrap();
+        // 默认使用 Galaxy 引擎
         let default_engine = galaxy::GalaxyEngine::new(stream_handle.clone());
         Self {
             active_engine: Box::new(default_engine),
@@ -47,6 +50,14 @@ impl AudioManager {
     }
 
     pub fn set_audio_device(&mut self, device_name: &str) -> Result<String, String> {
+        if device_name == "Default" {
+            let (stream, stream_handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+            self._stream = Some(StreamHolder(stream));
+            self.stream_handle = stream_handle.clone();
+            self.active_engine.update_output_stream(stream_handle);
+            return Ok("Switched to Default".to_string());
+        }
+
         let host = rodio::cpal::default_host();
         let device = host.output_devices().map_err(|e| e.to_string())?
             .find(|d| d.name().map(|n| n == device_name).unwrap_or(false));

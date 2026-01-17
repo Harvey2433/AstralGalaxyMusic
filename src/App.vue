@@ -5,10 +5,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { usePlayerStore } from './stores/player'; 
 import { 
   Play, Pause, SkipForward, SkipBack, ListMusic, Disc3, Settings, 
-  Heart, Mic2, Shuffle, Repeat, Volume1, VolumeX, Volume2,
+  Heart, Shuffle, Repeat, Volume1, VolumeX, Volume2,
   Cpu, Zap, HardDrive, Film, CheckCircle2, Terminal, Loader2, AlertCircle,
   Monitor, Sliders, LogOut, LayoutDashboard, ScanEye, Repeat1, AlertTriangle, PlusCircle, AudioLines, Speaker,
-  Activity
+  Activity, Radio, Orbit // 新增图标
 } from 'lucide-vue-next';
 
 const player = usePlayerStore();
@@ -31,8 +31,12 @@ const notify = (text: string, type: 'info' | 'error' = 'info') => {
 
 const currentIslandMode = computed<IslandMode>(() => {
   if (isNotificationVisible.value) return isError.value ? 'error' : 'notification';
-  if (player.isDragging || player.isSeeking || player.isBuffering) return 'loading'; 
-  if (player.isPlaying || player.currentTrack) return 'media';
+  if (player.isBuffering || player.isSeeking) return 'loading'; 
+  
+  // 🔥 核心修改：只有当正在播放且已经开始过播放时，才显示媒体状态
+  // 暂停时 isPlaying 为 false，会自动切换回 'idle'，触发淡出动画
+  if (player.isPlaying && player.hasStarted && player.currentTrack) return 'media';
+  
   return 'idle';
 });
 
@@ -62,7 +66,7 @@ watch(showSettings, (v) => { if (v) notify('SYSTEM CONFIGURATION'); });
 const switchTab = (t: string) => { activeTab.value = t; showSettings.value = t === 'settings'; };
 const switchToMain = () => { showSettings.value = false; activeTab.value = 'dashboard'; };
 
-// --- 引擎设置 (视觉重构版) ---
+// --- 引擎设置 ---
 const activeSettingTab = ref('core');
 const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
@@ -104,43 +108,27 @@ const startVolumeDrag = (e: MouseEvent) => { isDraggingVol.value = true; updateV
 const onVolumeDrag = (e: MouseEvent) => { if(isDraggingVol.value) updateVolume(e); };
 const stopVolumeDrag = () => { isDraggingVol.value = false; window.removeEventListener('mousemove', onVolumeDrag); window.removeEventListener('mouseup', stopVolumeDrag); };
 
-// 🔥 进度条完全解耦逻辑
-// localProgress 仅在拖拽时使用，与 Store 断开
+// 进度条逻辑
 const localProgress = ref(0);
-
 const onProgressInput = (e: Event) => {
     const target = e.target as HTMLInputElement;
     player.isDragging = true; 
     localProgress.value = parseFloat(target.value);
 };
-
 const onProgressChange = (e: Event) => {
     const target = e.target as HTMLInputElement;
     const val = parseFloat(target.value);
-    
-    // 立即发起 Seek，Store 负责处理 buffering 等待
     player.seekTo(val);
-    
-    // 延迟解锁 UI，防止 Seek 过程中进度条回弹
-    setTimeout(() => {
-        player.isDragging = false;
-    }, 100);
+    setTimeout(() => { player.isDragging = false; }, 100);
 };
 
 const toggleMute = () => { player.volume = player.volume > 0 ? 0 : 50; };
 
-// --- 动画 ---
-const starCanvas = ref<HTMLCanvasElement | null>(null);
-let animationFrameId: number;
-class Star { x!: number; y!: number; size!: number; opacity!: number; vx!: number; vy!: number; constructor(public w: number, public h: number) { this.reset(w, h); } reset(w:number,h:number){this.x=Math.random()*w;this.y=Math.random()*h;this.size=Math.random()*1.5;this.opacity=Math.random()*0.5+0.1;this.vx=(Math.random()-0.5)*0.2;this.vy=(Math.random()-0.5)*0.2;} draw(ctx:CanvasRenderingContext2D,w:number,h:number){this.x+=this.vx;this.y+=this.vy;if(this.x<0||this.x>w||this.y<0||this.y>h)this.reset(w,h);ctx.fillStyle=`rgba(255,255,255,${this.opacity})`;ctx.beginPath();ctx.arc(this.x,this.y,this.size,0,Math.PI*2);ctx.fill();}}
-const initCanvas = () => { const canvas = starCanvas.value; if(!canvas)return; const ctx = canvas.getContext('2d'); if(!ctx)return; canvas.width = window.innerWidth; canvas.height = window.innerHeight; const stars = Array.from({length:150},()=>new Star(canvas.width,canvas.height)); const animate = () => { ctx.clearRect(0,0,canvas.width,canvas.height); stars.forEach(s=>s.draw(ctx,canvas.width,canvas.height)); animationFrameId = requestAnimationFrame(animate); }; animate(); };
-
 onMounted(() => { 
-  initCanvas(); window.addEventListener('resize', initCanvas); notify('ASTRAL_SYSTEM ONLINE'); player.setNotifier(notify); player.initCheck(); player.fetchDevices();
+  notify('ASTRAL_SYSTEM ONLINE'); player.setNotifier(notify); player.initCheck(); player.fetchDevices();
   document.oncontextmenu = (e) => { e.preventDefault(); return false; };
   document.onkeydown = (e) => { if(e.key === 'F12' || (e.ctrlKey && e.key === 'r')) { e.preventDefault(); } };
 });
-onUnmounted(() => cancelAnimationFrame(animationFrameId));
 </script>
 
 <template>
@@ -158,12 +146,12 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
       
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'loading' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
         <Loader2 :size="16" class="text-starlight-cyan animate-spin shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">PROCESSING...</span>
+        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap">PROCESSING</span>
       </div>
 
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'notification' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
         <ScanEye :size="16" class="text-starlight-cyan animate-pulse shrink-0" />
-        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap overflow-hidden text-ellipsis">{{ notificationText }}</span>
+        <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-white whitespace-nowrap overflow-hidden text-ellipsis min-w-0">{{ notificationText }}</span>
       </div>
 
       <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-3 w-full justify-center" :class="currentIslandMode === 'error' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
@@ -171,9 +159,13 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
         <span class="text-[10px] font-mono font-bold tracking-[0.1em] text-red-100 whitespace-nowrap">{{ notificationText }}</span>
       </div>
 
-      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-4 w-full justify-between" :class="currentIslandMode === 'media' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
-        <div class="w-8 h-8 rounded-full overflow-hidden border border-white/20 relative shrink-0"><img :src="player.currentTrack?.cover" class="w-full h-full object-cover animate-spin-slow" /></div>
-        <div class="flex flex-col justify-center flex-1 min-w-0 py-1"><span class="text-xs font-bold text-white leading-tight break-words truncate text-left">{{ player.currentTrack?.title }}</span></div>
+      <div class="col-start-1 row-start-1 transition-opacity duration-300 flex items-center gap-4 w-full justify-between min-w-0" :class="currentIslandMode === 'media' ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'">
+        <div class="w-8 h-8 rounded-full overflow-hidden border border-white/20 relative shrink-0">
+            <img :src="player.currentTrack?.cover" class="w-full h-full object-cover animate-spin-slow" />
+        </div>
+        <div class="flex flex-col justify-center flex-1 min-w-0 py-1 overflow-hidden">
+            <span class="text-xs font-bold text-white leading-tight truncate text-left">{{ player.currentTrack?.title }}</span>
+        </div>
         <div class="flex items-end gap-[2px] h-4 shrink-0 ml-auto">
             <div class="w-[2px] bg-starlight-cyan rounded-full animate-wave-1" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
             <div class="w-[2px] bg-starlight-purple rounded-full animate-wave-2" :style="{ animationPlayState: player.isPaused ? 'paused' : 'running' }"></div>
@@ -182,9 +174,13 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
       </div>
     </div>
 
-    <canvas ref="starCanvas" class="absolute top-0 left-0 w-full h-full pointer-events-none z-0"></canvas>
-    <div class="absolute top-[-10%] right-[-10%] w-[500px] h-[500px] bg-starlight-purple/20 blur-[120px] rounded-full pointer-events-none"></div>
-    <div class="absolute bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-starlight-cyan/10 blur-[100px] rounded-full pointer-events-none"></div>
+    <div class="absolute top-[-15%] right-[-10%] w-[600px] h-[600px] rounded-full pointer-events-none z-0 animate-float-slow opacity-70"
+         style="background: radial-gradient(circle at 30% 30%, rgba(189, 52, 254, 0.4) 0%, rgba(80, 20, 120, 0.1) 60%, transparent 100%); box-shadow: inset -20px -20px 50px rgba(0,0,0,0.5); filter: blur(40px);"></div>
+    
+    <div class="absolute bottom-[-20%] left-[-15%] w-[700px] h-[700px] rounded-full pointer-events-none z-0 animate-float-slower opacity-60"
+         style="background: radial-gradient(circle at 70% 30%, rgba(100, 255, 218, 0.3) 0%, rgba(20, 120, 100, 0.05) 60%, transparent 100%); box-shadow: inset 20px 20px 50px rgba(0,0,0,0.5); filter: blur(50px);"></div>
+    
+    <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] opacity-20 mix-blend-overlay pointer-events-none z-0"></div>
 
     <div class="relative z-10 flex w-full h-full backdrop-blur-[1px]">
       <aside class="flex flex-col w-20 h-full border-r border-white/5 bg-cosmos-950/40 backdrop-blur-md z-50" data-tauri-drag-region>
@@ -221,20 +217,37 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
           </div>
 
           <div v-else-if="activeTab === 'dashboard'" class="absolute inset-0 flex flex-col items-center justify-center gap-8 p-10 z-20 transition-all duration-500" :class="showSettings ? 'opacity-0 scale-95 pointer-events-none blur-sm' : 'opacity-100 scale-100 blur-0'">
-              <div class="relative group">
-                <div class="absolute inset-0 rounded-full border border-starlight-cyan/30 scale-110 opacity-0 group-hover:scale-125 group-hover:opacity-100 transition-all duration-700"></div>
-                <div class="absolute inset-0 rounded-full border border-starlight-purple/30 scale-105 animate-pulse"></div>
-                <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering && !player.isPaused ? 'running' : 'paused' }">
-                  <img :src="player.currentTrack?.cover || 'https://images.unsplash.com/photo-1614728853913-6591d801d643?q=80&w=400&auto=format&fit=crop'" class="w-full h-full object-cover opacity-90 select-none" />
-                  <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 bg-cosmos-950 rounded-full border border-white/10 flex items-center justify-center">
-                    <div class="w-2 h-2 bg-starlight-cyan rounded-full" :class="{ 'animate-ping': player.isPlaying && !player.isBuffering && !player.isPaused }"></div>
+              
+              <div v-if="!player.hasStarted || !player.currentTrack" class="flex flex-col items-center justify-center gap-6 animate-fade-in">
+                  <div class="relative w-48 h-48 flex items-center justify-center">
+                      <div class="absolute inset-0 rounded-full border-[1px] border-starlight-purple/20 animate-spin-slow-reverse"></div>
+                      <div class="absolute inset-4 rounded-full border-[1px] border-starlight-cyan/20 border-t-transparent border-l-transparent animate-spin-slow"></div>
+                      <div class="absolute inset-8 rounded-full border-[1px] border-starlight-purple/30 animate-pulse-slow"></div>
+                      <div class="absolute w-4 h-4 bg-starlight-cyan rounded-full shadow-[0_0_20px_cyan] animate-pulse"></div>
+                      <Radio :size="24" class="text-starlight-cyan/50 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"/>
+                  </div>
+                  <div class="text-center space-y-2">
+                    <h1 class="text-3xl font-bold font-orbitron tracking-wider text-white drop-shadow-lg">No Track Selected</h1>
+                    <p class="text-sm text-cosmos-300 font-mono tracking-[0.3em] uppercase opacity-70">IDLE</p>
+                  </div>
+              </div>
+
+              <div v-else class="contents animate-fade-in">
+                <div class="relative group">
+                  <div class="absolute inset-0 rounded-full border border-starlight-cyan/30 scale-110 opacity-0 group-hover:scale-125 group-hover:opacity-100 transition-all duration-700"></div>
+                  <div class="absolute inset-0 rounded-full border border-starlight-purple/30 scale-105 animate-pulse"></div>
+                  <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering && !player.isPaused ? 'running' : 'paused' }">
+                    <img :src="player.currentTrack?.cover || DEFAULT_COVER" class="w-full h-full object-cover opacity-90 select-none" />
+                    <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 bg-cosmos-950 rounded-full border border-white/10 flex items-center justify-center">
+                      <div class="w-2 h-2 bg-starlight-cyan rounded-full" :class="{ 'animate-ping': player.isPlaying && !player.isBuffering && !player.isPaused }"></div>
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div class="text-center space-y-2 z-10 mt-8">
-                <h1 class="text-4xl font-bold font-orbitron tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-white via-starlight-cyan to-white drop-shadow-lg">{{ player.currentTrack?.title || 'No Track Selected' }}</h1>
-                <p class="text-lg text-cosmos-300 font-light tracking-widest uppercase">{{ player.currentTrack?.artist || 'Idle' }}</p>
+                <div class="text-center space-y-2 z-10 mt-8">
+                  <h1 class="text-4xl font-bold font-orbitron tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-white via-starlight-cyan to-white drop-shadow-lg">{{ player.currentTrack?.title || 'Unknown Track' }}</h1>
+                  <p class="text-lg text-cosmos-300 font-light tracking-widest uppercase">{{ player.currentTrack?.artist || 'Unknown Artist' }}</p>
                 </div>
+              </div>
           </div>
 
           <Transition name="slide-right">
@@ -275,6 +288,10 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
                             <h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3>
                             <p class="text-sm text-white/40">Select the audio core driver for signal processing.</p>
                         </div>
+                        <div class="flex items-center gap-2 bg-black/40 p-2 px-3 rounded border border-white/5">
+                            <Activity :size="14" class="text-starlight-cyan" />
+                            <span class="text-xs font-mono text-starlight-cyan/80">LATENCY: NORMAL</span>
+                        </div>
                     </div>
 
                     <div class="grid grid-cols-2 gap-4">
@@ -305,6 +322,7 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
                         <h4 class="text-base font-bold text-white mb-0.5 relative z-10">{{ engine.name }}</h4>
                         <p class="text-[10px] font-mono mb-2 uppercase opacity-80 relative z-10" :class="engine.color">{{ engine.sub }}</p>
                         <p class="text-xs text-white/40 leading-relaxed relative z-10">{{ engine.desc }}</p>
+                        <div v-if="player.activeEngine === engine.id" class="absolute -bottom-10 -right-10 w-32 h-32 blur-[60px] opacity-20 pointer-events-none" :class="engine.color.replace('text-', 'bg-')"></div>
                       </div>
                     </div>
                   </div>
@@ -350,7 +368,14 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
           </div>
 
           <div class="flex items-center justify-between">
-            <div class="flex items-center gap-4 w-1/3"><div class="w-12 h-12 rounded bg-white/5 border border-white/10 flex items-center justify-center"><Disc3 class="text-white/20" /></div><div class="text-sm"><div class="text-white max-w-[150px] truncate">{{ player.currentTrack?.title || 'No Track' }}</div><div class="text-xs text-white/40">{{ player.currentTrack?.artist || 'Unknown' }}</div></div></div>
+            <div class="flex items-center gap-4 w-1/3" :class="{ 'opacity-0': !player.hasStarted && !player.currentTrack }">
+                <div class="w-12 h-12 rounded bg-white/5 border border-white/10 flex items-center justify-center"><Disc3 class="text-white/20" /></div>
+                <div class="text-sm">
+                    <div class="text-white max-w-[150px] truncate">{{ player.currentTrack?.title || 'No Track' }}</div>
+                    <div class="text-xs text-white/40">{{ player.currentTrack?.artist || 'Unknown' }}</div>
+                </div>
+            </div>
+            
             <div class="flex items-center gap-6">
               <button class="text-white/40 hover:text-white transition-colors no-drag-btn no-outline" @click="player.toggleMode"><Shuffle v-if="player.playMode === 'shuffle'" :size="20" class="text-starlight-cyan"/><Repeat1 v-else-if="player.playMode === 'loop'" :size="20" class="text-starlight-cyan"/><Repeat v-else :size="20"/></button>
               <button class="text-white hover:text-starlight-cyan transition-colors no-drag-btn no-outline" @click="player.prevTrack"><SkipBack :size="28" fill="currentColor"/></button>
@@ -370,15 +395,22 @@ onUnmounted(() => cancelAnimationFrame(animationFrameId));
 </template>
 
 <style scoped>
-/* Animations */
 .rotate-center { animation: rotate-record 10s linear infinite; }
 @keyframes rotate-record { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .animate-spin-slow { animation: spin 8s linear infinite; }
+.animate-spin-slow-reverse { animation: spin 12s linear infinite reverse; }
+.animate-pulse-slow { animation: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+/* 新增浮动动画 */
+@keyframes float-slow { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(-20px) rotate(2deg); } }
+@keyframes float-slower { 0%, 100% { transform: translateY(0) rotate(0deg); } 50% { transform: translateY(30px) rotate(-3deg); } }
+.animate-float-slow { animation: float-slow 15s ease-in-out infinite; }
+.animate-float-slower { animation: float-slower 20s ease-in-out infinite reverse; }
+
 [data-tauri-drag-region] { -webkit-app-region: drag; cursor: default; user-select: none; }
 button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 
-.animate-fade-in { animation: fadeIn 0.3s ease-out; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+.animate-fade-in { animation: fadeIn 0.5s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
 @keyframes wave { 0%, 100% { height: 4px; } 50% { height: 12px; } }
 .animate-wave-1 { animation: wave 0.8s infinite ease-in-out; }
 .animate-wave-2 { animation: wave 1.1s infinite ease-in-out; }
@@ -394,11 +426,4 @@ button, input, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 .fade-enter-active { transition: opacity 0.3s ease-out; }
 .fade-leave-active { transition: opacity 0.2s ease-in; }
 .fade-enter-from, .fade-leave-to { opacity: 0; }
-</style>
-
-<style>
-:root { --focus-ring: none !important; }
-*, *::before, *::after { -webkit-tap-highlight-color: transparent; outline: none !important; }
-button:focus, button:active, button:focus-visible, .no-outline:focus { outline: none !important; box-shadow: none !important; border-color: transparent !important; }
-button::-moz-focus-inner { border: 0; }
 </style>

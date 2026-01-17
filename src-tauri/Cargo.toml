@@ -35,6 +35,9 @@ symphonia = { version = "0.5", features = [
     "alac",
 ] }
 chrono = "0.4"
+biquad = "0.4.2"      # 滤波库
+rubato = "0.14"       # 发烧级重采样库
+crossbeam-channel = "0.5" # 用于高效线程通信
 
 [profile.dev.package."*"]
 opt-level = 3
