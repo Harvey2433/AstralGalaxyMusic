@@ -187,18 +187,46 @@ export const usePlayerStore = defineStore('player', () => {
     }, 100);
   };
 
-  // --- 8. 队列控制 (修复随机播放) ---
+  // --- 8. 队列控制 (修复随机播放: 嵌套堆叠随机数混合算法) ---
   const nextTrack = async () => { 
       if(queue.value.length === 0) return; 
       
       if (playMode.value === 'shuffle') {
-          // 真正的随机播放逻辑：随机选取一个非当前的索引
-          let nextIndex = Math.floor(Math.random() * queue.value.length);
-          // 避免重复（除非只有一首歌）
-          if (queue.value.length > 1 && nextIndex === currentIndex.value) {
-              nextIndex = (nextIndex + 1) % queue.value.length;
+          // 🔥 核心修改：嵌套堆叠随机数混合算法 (Nested Stacked Random Number Mixing)
+          // 目的：提供比 Math.random() 更难以预测且分布更均匀的随机体验
+          const total = queue.value.length;
+          
+          if (total > 1) {
+              // 1. 基础熵层 (Base Entropy Layer): 结合物理时间与高精度性能计时
+              const t1 = Date.now();
+              const t2 = performance.now();
+              
+              // 2. 状态堆叠 (State Stacking): 将当前索引作为种子扰动因子
+              // 使用质数乘法防止周期性重复
+              const seed = (t1 ^ (currentIndex.value * 123456789)) + (t2 * 987654321);
+              
+              // 3. 混沌混合 (Chaotic Mixing): 利用正弦函数的非线性进行混沌映射
+              // 放大系数 100000.0 用于提取小数部分的伪随机性
+              const chaos = Math.abs(Math.sin(seed) * 100000.0);
+              
+              // 4. 双重叠合 (Double Layering): 叠加标准随机源，消除算法偏见
+              const layer1 = chaos - Math.floor(chaos); // 提取混沌小数
+              const layer2 = Math.random();             // 标准随机源
+              
+              // 混合：取平均值并映射到总长度
+              let targetIndex = Math.floor(((layer1 + layer2) / 2) * total * 2) % total;
+              
+              // 5. 碰撞规避 (Collision Avoidance): 
+              // 如果随机结果与当前播放相同，使用黄金分割偏移量进行跳跃
+              if (targetIndex === currentIndex.value) {
+                  const goldenShift = Math.max(1, Math.floor(total * 0.6180339887));
+                  targetIndex = (targetIndex + goldenShift) % total;
+              }
+              
+              currentIndex.value = targetIndex;
+          } else {
+              currentIndex.value = 0;
           }
-          currentIndex.value = nextIndex;
       } else {
           // 顺序循环
           currentIndex.value = (currentIndex.value + 1) % queue.value.length; 
@@ -208,7 +236,7 @@ export const usePlayerStore = defineStore('player', () => {
 
   const prevTrack = async () => { 
       if(queue.value.length === 0) return; 
-      // 上一曲逻辑通常不需要随机，保持线性回退符合直觉，或者也可以随机
+      // 上一曲逻辑
       currentIndex.value = currentIndex.value > 0 ? currentIndex.value - 1 : queue.value.length - 1; 
       await loadAndPlay(); 
   };

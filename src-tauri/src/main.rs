@@ -5,12 +5,16 @@ mod audio;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+// 🔥 修复点 1: 必须导入 Read trait 才能使用 read_to_end
+use std::io::Read; 
+
 use tauri::{State, Emitter, Window}; 
 use lofty::{read_from_path, Accessor, TaggedFileExt, AudioFile}; 
 use rfd::FileDialog;
 use base64::{Engine as _, engine::general_purpose};
 use rayon::prelude::*;
-use encoding_rs::GBK;
+// 🔥 修复点 2: 显式导入 UTF_8 和 GBK
+use encoding_rs::{GBK, UTF_8}; 
 use audio::AudioManager; 
 
 struct AppState {
@@ -22,6 +26,7 @@ struct TrackMetadata {
     path: String, title: String, artist: String, album: String, cover: String, duration: f64,
 }
 
+// 修复乱码函数
 fn repair_mojibake(input: &str) -> String {
     if input.chars().any(|c| c as u32 > 0xFF) { return input.to_string(); }
     let bytes: Vec<u8> = input.chars().map(|c| c as u8).collect();
@@ -30,6 +35,7 @@ fn repair_mojibake(input: &str) -> String {
     input.to_string()
 }
 
+// 提取元数据
 fn extract_metadata(path: &PathBuf) -> TrackMetadata {
     let filename = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let mut meta = TrackMetadata {
@@ -51,22 +57,18 @@ fn extract_metadata(path: &PathBuf) -> TrackMetadata {
     meta
 }
 
+// 查找封面
 fn find_cover_image(file_path: &Path, tag: &lofty::Tag) -> String {
-    // 1. 优先使用内嵌封面
     if let Some(picture) = tag.pictures().first() {
         let base64_str = general_purpose::STANDARD.encode(picture.data());
         let mime = picture.mime_type().as_str(); 
         return format!("data:{};base64,{}", mime, base64_str);
     }
-
-    // 2. 严格模式：只匹配与音频文件同名的图片
     if let Some(parent) = file_path.parent() {
         let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        // 例如：song.mp3 -> song.jpg / song.png
         let exact_matches = vec![
             format!("{}.jpg", stem), format!("{}.png", stem), format!("{}.jpeg", stem)
         ];
-        
         for name in &exact_matches {
             let img_path = parent.join(name);
             if img_path.exists() {
@@ -76,12 +78,38 @@ fn find_cover_image(file_path: &Path, tag: &lofty::Tag) -> String {
                 }
             }
         }
-        
-        // 🔥🔥🔥 修复点：已移除 generic_names (cover.jpg, folder.jpg) 的搜索
-        // 这样可以防止单曲混在 "Downloads" 文件夹时，错误读取到其他专辑的封面
     }
-    
     "DEFAULT_COVER".to_string()
+}
+
+// --- 命令区 ---
+
+// 🔥 新增：获取歌词命令
+#[tauri::command]
+async fn get_lyrics(path: String) -> Result<String, String> {
+    let audio_path = Path::new(&path);
+    // 尝试找同名 .lrc 文件
+    let lrc_path = audio_path.with_extension("lrc");
+
+    if lrc_path.exists() {
+        let mut file = fs::File::open(lrc_path).map_err(|e| e.to_string())?;
+        let mut buffer = Vec::new();
+        // 这里需要 use std::io::Read;
+        file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+
+        // 1. 尝试 UTF-8
+        let (decoded, _, had_errors) = UTF_8.decode(&buffer);
+        if !had_errors {
+            return Ok(decoded.into_owned());
+        }
+        
+        // 2. 如果 UTF-8 失败，尝试 GBK (兼容老歌词文件)
+        let (decoded_gbk, _, _) = GBK.decode(&buffer);
+        return Ok(decoded_gbk.into_owned());
+    }
+
+    // 没有歌词文件则返回空
+    Ok("".to_string())
 }
 
 #[tauri::command]
@@ -156,7 +184,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             import_music, check_file_exists, init_audio_engine, 
             player_load_track, player_play, player_pause, player_seek, player_set_volume,
-            player_set_channels, get_output_devices, set_output_device
+            player_set_channels, get_output_devices, set_output_device,
+            get_lyrics // <--- 记得这里注册了新命令
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

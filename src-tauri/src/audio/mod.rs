@@ -2,7 +2,6 @@
 
 pub mod galaxy;
 pub mod ffmpeg;
-pub mod dsp; // 🔥 必须添加这一行，否则 galaxy.rs 找不到 dsp
 
 use rodio::{OutputStream, OutputStreamHandle};
 use rodio::cpal::traits::{HostTrait, DeviceTrait};
