@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 // 🔥 修复点 1: 必须导入 Read trait 才能使用 read_to_end
 use std::io::Read; 
 
-use tauri::{State, Emitter, Window}; 
+// 🔥 修改点: 引入 Manager 以获取 app_handle
+use tauri::{State, Emitter, Window, Manager}; 
 use lofty::{read_from_path, Accessor, TaggedFileExt, AudioFile}; 
 use rfd::FileDialog;
 use base64::{Engine as _, engine::general_purpose};
@@ -16,6 +17,8 @@ use rayon::prelude::*;
 // 🔥 修复点 2: 显式导入 UTF_8 和 GBK
 use encoding_rs::{GBK, UTF_8}; 
 use audio::AudioManager; 
+// 🔥 新增: 引入 FFmpeg 引擎用于静态检测
+use audio::ffmpeg::FFmpegEngine;
 
 struct AppState {
     audio_manager: Arc<Mutex<AudioManager>>,
@@ -132,8 +135,35 @@ async fn import_music(window: Window) -> Result<(), String> {
 #[tauri::command]
 fn check_file_exists(path: String) -> bool { Path::new(&path).exists() }
 
+// 🔥 修改核心: 初始化引擎逻辑，支持 FFmpeg 自动下载
 #[tauri::command]
-fn init_audio_engine(state: State<AppState>, engine_id: String) -> Result<String, String> {
+async fn init_audio_engine(window: Window, state: State<'_, AppState>, engine_id: String) -> Result<String, String> {
+    if engine_id == "ffmpeg" {
+        // 1. 检查环境变量及本地安装
+        let available = FFmpegEngine::check_availability(window.app_handle());
+        
+        if available {
+            // 可用则直接切换
+            state.audio_manager.lock().unwrap().switch_engine(&engine_id)?;
+            return Ok("ENGINE_FFMPEG_READY".to_string());
+        } else {
+            // 2. 不可用，启动后台下载任务
+            let win_clone = window.clone();
+            tauri::async_runtime::spawn(async move {
+                // 执行下载与解压逻辑
+                if let Err(e) = FFmpegEngine::download_and_install(win_clone.clone()).await {
+                    println!("FFmpeg auto-install failed: {}", e);
+                    // 发送错误状态给前端
+                    let _ = win_clone.emit("ffmpeg-status", "error");
+                }
+            });
+            
+            // 返回下载中状态，前端据此显示加载/进度UI
+            return Ok("DOWNLOADING".to_string());
+        }
+    }
+    
+    // 其他引擎（如 Galaxy）直接切换
     state.audio_manager.lock().unwrap().switch_engine(&engine_id)
 }
 
@@ -175,6 +205,16 @@ fn get_output_devices(state: State<AppState>) -> Vec<String> { state.audio_manag
 #[tauri::command]
 fn set_output_device(state: State<AppState>, device: String) -> Result<String, String> { state.audio_manager.lock().unwrap().set_audio_device(&device) }
 
+// 🔥 新增辅助命令：同步前端状态用
+#[tauri::command]
+fn get_current_engine(state: State<AppState>) -> String {
+    // 这里简单返回 active_engine 的名称，实际生产中可以在 AudioManager 里存一个 enum 状态
+    // 为了简化，这里我们根据 name 判断，或者你可以让 AudioManager 增加一个 get_engine_id 方法
+    // 这里暂时假设如果不是 FFmpeg 就默认是 Galaxy
+    let name = state.audio_manager.lock().unwrap().active_engine.name().to_string();
+    if name.contains("FFmpeg") { "ffmpeg".to_string() } else { "galaxy".to_string() }
+}
+
 fn main() {
     let audio_manager = Arc::new(Mutex::new(AudioManager::new()));
     tauri::Builder::default()
@@ -185,7 +225,7 @@ fn main() {
             import_music, check_file_exists, init_audio_engine, 
             player_load_track, player_play, player_pause, player_seek, player_set_volume,
             player_set_channels, get_output_devices, set_output_device,
-            get_lyrics // <--- 记得这里注册了新命令
+            get_lyrics, get_current_engine // <--- 注册了新命令
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

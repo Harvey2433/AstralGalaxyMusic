@@ -23,7 +23,8 @@ pub trait AudioEngine: Send + Sync {
 }
 
 pub struct AudioManager {
-    active_engine: Box<dyn AudioEngine>,
+    // 🔥 修改: 设为 pub 以便 main.rs 获取当前引擎状态
+    pub active_engine: Box<dyn AudioEngine>,
     _stream: Option<StreamHolder>, 
     stream_handle: OutputStreamHandle,
 }
@@ -83,12 +84,11 @@ impl AudioManager {
                 Ok("ENGINE_GALAXY_READY".to_string())
             }
             "ffmpeg" => {
-                if ffmpeg::FFmpegEngine::check_availability() {
-                    self.active_engine = Box::new(ffmpeg::FFmpegEngine::new());
-                    Ok("ENGINE_FFMPEG_READY".to_string())
-                } else {
-                    Err("FFMPEG_MISSING".to_string())
-                }
+                // 🔥 修改: 这里的 check_availability 已移除
+                // 因为检测逻辑现在依赖 AppHandle (查找本地文件)，已移动到 main.rs 的 init_audio_engine 中处理
+                // 当代码执行到这里时，我们假设 main.rs 已经完成了环境校验或下载解压
+                self.active_engine = Box::new(ffmpeg::FFmpegEngine::new(self.stream_handle.clone()));
+                Ok("ENGINE_FFMPEG_READY".to_string())
             }
             _ => Err("UNKNOWN_ENGINE".to_string())
         }
