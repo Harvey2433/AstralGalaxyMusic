@@ -2,7 +2,7 @@
 name = "astralgalaxymusicplayer"
 version = "0.1.0"
 description = "A next-gen music player"
-authors = ["you"]
+authors = ["梦梦姐"]
 edition = "2021"
 
 [build-dependencies]
@@ -15,37 +15,44 @@ tauri-plugin-shell = "2.0.0-beta"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# 🔥 核心音频栈
+# 🔥 修正后的 Windows Features：增加 foundation_concurrency 以支持 .await
+windows = { version = "0.58.0", features = [
+    "Media_Control",
+    "Storage_Streams",
+    "Storage",
+    "Foundation",
+    "Win32_System_WinRT_Media",
+    "Win32_Foundation"
+] }
+souvlaki = "0.7"
+raw-window-handle = "0.6"
+url = "2.5"
+urlencoding = "2.1"
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
-# 🔥 内存映射 (实现零拷贝、秒开的关键)
 memmap2 = "0.9"
 ringbuf = "0.4"
-# 元数据与工具
 lofty = "0.15"
 rfd = "0.14"
 base64 = "0.21"
 rayon = "1.8"
 encoding_rs = "0.8"
 claxon = "0.4"
-symphonia = { version = "0.5", features = [
-    "flac",
-    "wav",
-    "mp3",
-    "aac",
-    "alac",
-] }
+symphonia = { version = "0.5", features = ["flac", "wav", "mp3", "aac", "alac"] }
 chrono = "0.4"
-biquad = "0.4.2"      # 滤波库
-rubato = "0.14"       # 发烧级重采样库
-crossbeam-channel = "0.5" # 用于高效线程通信
-zip = "2.2"  # 版本号可能会更新，以 cargo add 为准
+biquad = "0.4.2"
+rubato = "0.14"
+crossbeam-channel = "0.5"
+zip = "2.2"  
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
-[profile.dev.package."*"]
-opt-level = 3
 
-# 发布模式保持最高优化 + LTO
+# 🔥 极致优化配置
+#[profile.dev.package."*"]
+#opt-level = 3
+
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
+overflow-checks = false

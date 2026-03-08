@@ -12,7 +12,6 @@ export type PlayMode = 'sequence' | 'loop' | 'shuffle';
 type NotificationCallback = (msg: string, type?: 'info' | 'error') => void;
 
 export const usePlayerStore = defineStore('player', () => {
-  // --- 1. 核心状态 ---
   const isPlaying = ref(false);
   const isPaused = ref(false);
   const hasStarted = ref(false);
@@ -22,21 +21,19 @@ export const usePlayerStore = defineStore('player', () => {
   const playMode = ref<PlayMode>('sequence');
   const showPlaylist = ref(false);
   
-  // --- 2. 交互锁 ---
   const isDragging = ref(false);   
   const isBuffering = ref(false);  
   const isSeeking = ref(false);    
   const playSessionId = ref(0);    
   
-  // 🔥 引擎与下载状态
   const activeEngine = ref('galaxy'); 
   const isDownloadingFFmpeg = ref(false);
   const ffmpegProgress = ref(0);
   
-  // 🔥 冷启动标志
+  // 🔥 新增：并发切换防抖锁与冷启动标志
+  const isEngineSwitching = ref(false);
   const hasAudioInitialized = ref(false);
 
-  // --- 3. 辅助状态 ---
   let actionTimeoutId: any = null;
   const likedTracks = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem('liked_tracks') || '[]')));
   const availableDevices = ref<string[]>([]);
@@ -52,101 +49,144 @@ export const usePlayerStore = defineStore('player', () => {
   });
   const likedQueue = computed(() => queue.value.filter(t => likedTracks.value.has(t.id)));
 
-  // --- 4. 初始化与事件监听 ---
   const syncEngine = async () => {
       try {
           const realEngine = await invoke<string>('get_current_engine');
           activeEngine.value = realEngine;
-          console.log("Current Engine synced:", realEngine);
       } catch (e) { console.error("Sync Engine Failed:", e); }
   };
 
   onMounted(async () => {
       await syncEngine();
       
-      // 监听 FFmpeg 状态事件
       await listen('ffmpeg-status', async (e: any) => {
           const status = e.payload;
           if (status === 'downloading') {
               isDownloadingFFmpeg.value = true;
               ffmpegProgress.value = 0;
-              notifyUI.value?.('正在下载组件...', 'info');
-          } else if (status === 'extracting') { // 🔥 新增：解压状态处理
+              notifyUI.value?.('FETCHING ENGINE...', 'info');
+          } else if (status === 'extracting') { 
               isDownloadingFFmpeg.value = true;
               ffmpegProgress.value = 99;
-              notifyUI.value?.('下载完成，正在解压...', 'info');
+              notifyUI.value?.('EXTRACTING COMPONENTS...', 'info');
           } else if (status === 'ready') { 
               isDownloadingFFmpeg.value = false;
               ffmpegProgress.value = 100;
-              notifyUI.value?.('组件安装完成，正在应用...');
-              // 自动完成未竟的切换
-              await switchEngine('ffmpeg');
+              notifyUI.value?.('FFMPEG READY. INITIALIZING...');
+              
+              const savedTime = currentTime.value;
+              const wasPlaying = isPlaying.value;
+              
+              if (wasPlaying) {
+                  await invoke('player_pause');
+              }
+
+              try {
+                  isEngineSwitching.value = true; // 加锁
+                  const res = await invoke<string>('init_audio_engine', { engineId: 'ffmpeg' });
+                  
+                  if (res.includes("READY")) {
+                      activeEngine.value = 'ffmpeg';
+                      if (currentTrack.value) {
+                          // 🔥 魔术修复：静音 -> 加载 -> Seek -> 恢复音量
+                          await invoke('player_set_volume', { vol: 0.0 });
+                          await invoke('player_load_track', { path: currentTrack.value.path });
+                          await invoke('player_seek', { time: savedTime });
+                          
+                          if (wasPlaying) {
+                              await executePlayLogic(false); 
+                              notifyUI.value?.('FFMPEG ONLINE. RESUMING.');
+                          } else {
+                              await invoke('player_set_volume', { vol: volume.value / 100.0 });
+                              await invoke('player_pause');
+                          }
+                      }
+                  } else {
+                      notifyUI.value?.('FFMPEG ENGINE CRASHED', 'error');
+                  }
+              } catch (err) {
+                  notifyUI.value?.('FFMPEG FAILED TO LOAD', 'error');
+              } finally {
+                  isEngineSwitching.value = false; // 解锁
+              }
           } else if (status === 'error') {
               isDownloadingFFmpeg.value = false;
-              notifyUI.value?.('组件下载失败，请检查网络', 'error');
+              notifyUI.value?.('DOWNLOAD FAILED. CHECK NETWORK.', 'error');
           }
       });
 
       await listen('ffmpeg-progress', (e: any) => {
           ffmpegProgress.value = e.payload as number;
       });
-      
-      await listen('download-success', async (e: any) => {
-          if (e.payload === 'ffmpeg') {
-              await switchEngine('ffmpeg');
-          }
-      });
 
       await setupEventListeners();
   });
 
-  // --- 5. 引擎切换核心逻辑 ---
-  const switchEngine = async (engineId: string) => {
-      // 🔥 修改：如果正在下载，严格禁止切换任何引擎
+  const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED'> => {
       if (isDownloadingFFmpeg.value) {
-          notifyUI.value?.('后台任务进行中，请等待安装完成', 'error');
-          return;
+          notifyUI.value?.('PLEASE WAIT FOR DOWNLOAD', 'error');
+          return 'FAILED';
+      }
+      // 🔥 强行打断你的手残连点
+      if (isEngineSwitching.value) {
+          notifyUI.value?.('系统切换中，请勿频繁点击！', 'error');
+          return 'FAILED';
       }
       
-      // 乐观更新
-      activeEngine.value = engineId;
+      const previousEngine = activeEngine.value;
+      if (previousEngine === engineId) return 'SUCCESS';
       
+      isEngineSwitching.value = true; // 上锁
       notifyUI.value?.(`正在切换至 ${engineId.toUpperCase()}...`);
-      const savedTime = currentTime.value;
-      const wasPlaying = isPlaying.value;
-
+      
       try {
+          // 先暂停当前播放，释放设备并防止爆音
+          const savedTime = currentTime.value;
+          const wasPlaying = isPlaying.value;
+          if (wasPlaying) {
+              await invoke('player_pause');
+          }
+
           const res = await invoke<string>('init_audio_engine', { engineId });
           
-          // Case A: 需要下载
           if (res === "DOWNLOADING") {
               isDownloadingFFmpeg.value = true;
-              notifyUI.value?.("正在下载必要组件 FFmpeg...");
-              // 保持 activeEngine 为 ffmpeg 以显示加载态
-              return;
+              activeEngine.value = previousEngine; // 状态回滚给 UI
+              if (wasPlaying) await executePlayLogic(false); // 恢复原引擎播放
+              isEngineSwitching.value = false; // 解锁
+              return 'DOWNLOADING';
           }
           
-          // Case B: 切换成功 (READY)
           if (res.includes("READY") || res === "SUCCESS") {
               hasAudioInitialized.value = true;
-              notifyUI.value?.(`${engineId.toUpperCase()} 就绪`);
+              activeEngine.value = engineId;
               
-              // 恢复播放状态
-              if (wasPlaying && currentTrack.value) {
+              if (currentTrack.value) {
+                  // 🔥 魔术修复：强行把音频按在水底，等接回进度条再拉上来
+                  await invoke('player_set_volume', { vol: 0.0 });
                   await invoke('player_load_track', { path: currentTrack.value.path });
                   await invoke('player_seek', { time: savedTime });
-                  await executePlayLogic(false); 
+                  
+                  if (wasPlaying) {
+                      await executePlayLogic(false); // 内部含有延迟的 set_volume 和 play
+                  } else {
+                      await invoke('player_set_volume', { vol: volume.value / 100.0 });
+                      await invoke('player_pause');
+                  }
               }
+              isEngineSwitching.value = false;
+              return 'SUCCESS';
           }
+          throw new Error("Invalid response");
       } catch (e: any) {
+          console.error(e);
           notifyUI.value?.(`切换失败: ${e}`, 'error');
-          // 失败回滚
           await syncEngine();
-          isDownloadingFFmpeg.value = false;
+          isEngineSwitching.value = false;
+          return 'FAILED';
       }
   };
 
-  // --- 6. 基础功能 ---
   const toggleLike = (track: Track) => {
     if (likedTracks.value.has(track.id)) { likedTracks.value.delete(track.id); } 
     else { likedTracks.value.add(track.id); }
@@ -161,7 +201,6 @@ export const usePlayerStore = defineStore('player', () => {
     } catch (e) { availableDevices.value = ['Default']; } 
   };
 
-  // --- 7. 播放控制核心 ---
   const executePlayLogic = async (isNewTrack: boolean) => {
       try {
         if (isNewTrack) await invoke('player_set_volume', { vol: volume.value / 100.0 });
@@ -171,6 +210,7 @@ export const usePlayerStore = defineStore('player', () => {
         isPaused.value = false;
         if (!hasStarted.value) hasStarted.value = true;
         startProgressLoop(); 
+        // 延迟执行音量推子，完美掩盖加载噪音
         setTimeout(() => { invoke('player_set_volume', { vol: volume.value / 100.0 }); }, 100);
       } catch (e) { console.error(e); }
   };
@@ -214,7 +254,6 @@ export const usePlayerStore = defineStore('player', () => {
     actionTimeoutId = setTimeout(async () => {
         try {
             if (!hasAudioInitialized.value) {
-                console.log("🔥 Cold Start: Forcing Audio Device Wakeup...");
                 await invoke('set_output_device', { device: activeDevice.value });
                 hasAudioInitialized.value = true;
             }
@@ -307,7 +346,7 @@ export const usePlayerStore = defineStore('player', () => {
     await listen<Track>('import-track', (event) => {
       const t = event.payload;
       if (!queue.value.some(track => track.path === t.path)) {
-        queue.value.push({ ...t, id: Date.now().toString() + Math.random().toString(36).substr(2, 6), cover: t.cover === 'DEFAULT_COVER' ? DEFAULT_COVER : t.cover, isAvailable: true });
+        queue.value.push({ ...t, id: Date.now().toString() + Math.random().toString(36).substring(2, 8), cover: t.cover === 'DEFAULT_COVER' ? DEFAULT_COVER : t.cover, isAvailable: true });
       }
     });
     await listen('import-finish', () => { notifyUI.value?.('LIBRARY UPDATED'); });
@@ -343,7 +382,6 @@ export const usePlayerStore = defineStore('player', () => {
   };
   const stopProgressLoop = () => { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } };
 
-  // 防止重复绑定
   let listenersBound = false;
 
   watch(volume, (v) => { invoke('player_set_volume', { vol: v / 100.0 }); });
