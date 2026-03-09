@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "astralgalaxymusicplayer",
+        "title": "Astral Galaxy Music Player",
         "width": 1313,
         "height": 766,
         "center": true,

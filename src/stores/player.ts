@@ -9,7 +9,8 @@ export interface Track {
   id: string; title: string; artist: string; album: string; cover: string; duration: number; path: string; isAvailable?: boolean; 
 }
 export type PlayMode = 'sequence' | 'loop' | 'shuffle';
-type NotificationCallback = (msg: string, type?: 'info' | 'error') => void;
+
+type NotificationCallback = (msg: string, type?: 'info' | 'error' | 'cooling') => void;
 
 export const usePlayerStore = defineStore('player', () => {
   const isPlaying = ref(false);
@@ -30,11 +31,16 @@ export const usePlayerStore = defineStore('player', () => {
   const isDownloadingFFmpeg = ref(false);
   const ffmpegProgress = ref(0);
   
-  // 🔥 新增：并发切换防抖锁与冷启动标志
+  const isSmtcEnabled = ref(JSON.parse(localStorage.getItem('smtc_enabled') || 'true'));
   const isEngineSwitching = ref(false);
   const hasAudioInitialized = ref(false);
+  const lastEngineSwitchTime = ref(0);
+  const engineCoolingRemaining = ref(0);
 
+  const isTrackSwitching = ref(false);
   let actionTimeoutId: any = null;
+  let coolingTimerId: any = null; // 独立保存冷却计时器的引用，防止冲突
+
   const likedTracks = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem('liked_tracks') || '[]')));
   const availableDevices = ref<string[]>([]);
   const activeDevice = ref('Default');
@@ -54,6 +60,24 @@ export const usePlayerStore = defineStore('player', () => {
           const realEngine = await invoke<string>('get_current_engine');
           activeEngine.value = realEngine;
       } catch (e) { console.error("Sync Engine Failed:", e); }
+  };
+
+  // 🔥 修复关键 1：重新封装的极严谨计时器，真正从调用这一刻开始算冷却！
+  const startCoolingTimer = () => {
+      if (coolingTimerId) clearInterval(coolingTimerId); // 清除可能存在的旧计时器
+      lastEngineSwitchTime.value = Date.now(); // 记录切换成功的那一刻
+      engineCoolingRemaining.value = 30;
+
+      coolingTimerId = setInterval(() => {
+          const elapsed = (Date.now() - lastEngineSwitchTime.value) / 1000;
+          if (elapsed >= 30) {
+              engineCoolingRemaining.value = 0;
+              clearInterval(coolingTimerId);
+              coolingTimerId = null;
+          } else {
+              engineCoolingRemaining.value = Math.ceil(30 - elapsed);
+          }
+      }, 1000);
   };
 
   onMounted(async () => {
@@ -76,38 +100,36 @@ export const usePlayerStore = defineStore('player', () => {
               
               const savedTime = currentTime.value;
               const wasPlaying = isPlaying.value;
-              
-              if (wasPlaying) {
-                  await invoke('player_pause');
-              }
+              if (wasPlaying) await invoke('player_pause');
 
               try {
-                  isEngineSwitching.value = true; // 加锁
+                  isEngineSwitching.value = true;
                   const res = await invoke<string>('init_audio_engine', { engineId: 'ffmpeg' });
                   
                   if (res.includes("READY")) {
                       activeEngine.value = 'ffmpeg';
                       if (currentTrack.value) {
-                          // 🔥 魔术修复：静音 -> 加载 -> Seek -> 恢复音量
                           await invoke('player_set_volume', { vol: 0.0 });
                           await invoke('player_load_track', { path: currentTrack.value.path });
                           await invoke('player_seek', { time: savedTime });
                           
+                          await invoke('player_set_volume', { vol: Math.max(0.01, volume.value / 100.0) });
+
                           if (wasPlaying) {
                               await executePlayLogic(false); 
                               notifyUI.value?.('FFMPEG ONLINE. RESUMING.');
                           } else {
-                              await invoke('player_set_volume', { vol: volume.value / 100.0 });
                               await invoke('player_pause');
                           }
                       }
-                  } else {
-                      notifyUI.value?.('FFMPEG ENGINE CRASHED', 'error');
+                      
+                      // 🔥 修复关键 2：漫长的下载和解压完全结束后，在此刻才开始 30 秒倒计时！
+                      startCoolingTimer();
                   }
               } catch (err) {
                   notifyUI.value?.('FFMPEG FAILED TO LOAD', 'error');
               } finally {
-                  isEngineSwitching.value = false; // 解锁
+                  isEngineSwitching.value = false;
               }
           } else if (status === 'error') {
               isDownloadingFFmpeg.value = false;
@@ -115,45 +137,42 @@ export const usePlayerStore = defineStore('player', () => {
           }
       });
 
-      await listen('ffmpeg-progress', (e: any) => {
-          ffmpegProgress.value = e.payload as number;
-      });
-
+      await listen('ffmpeg-progress', (e: any) => { ffmpegProgress.value = e.payload as number; });
       await setupEventListeners();
   });
 
-  const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED'> => {
-      if (isDownloadingFFmpeg.value) {
-          notifyUI.value?.('PLEASE WAIT FOR DOWNLOAD', 'error');
-          return 'FAILED';
-      }
-      // 🔥 强行打断你的手残连点
-      if (isEngineSwitching.value) {
-          notifyUI.value?.('系统切换中，请勿频繁点击！', 'error');
-          return 'FAILED';
+  const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED' | 'COOLING'> => {
+      if (isDownloadingFFmpeg.value || isEngineSwitching.value) return 'FAILED';
+      
+      const now = Date.now();
+      if (now - lastEngineSwitchTime.value < 30000) {
+          const remaining = Math.ceil(30 - (now - lastEngineSwitchTime.value) / 1000);
+          notifyUI.value?.(`SYSTEM COOLING: ${remaining}S`, 'cooling');
+          return 'COOLING';
       }
       
       const previousEngine = activeEngine.value;
       if (previousEngine === engineId) return 'SUCCESS';
       
-      isEngineSwitching.value = true; // 上锁
-      notifyUI.value?.(`正在切换至 ${engineId.toUpperCase()}...`);
+      isEngineSwitching.value = true;
+      notifyUI.value?.(`INITIALIZING ${engineId.toUpperCase()}...`);
       
       try {
-          // 先暂停当前播放，释放设备并防止爆音
           const savedTime = currentTime.value;
           const wasPlaying = isPlaying.value;
+          
           if (wasPlaying) {
-              await invoke('player_pause');
+              await executePauseLogic();
+              await new Promise(r => setTimeout(r, 500)); 
           }
 
           const res = await invoke<string>('init_audio_engine', { engineId });
           
           if (res === "DOWNLOADING") {
               isDownloadingFFmpeg.value = true;
-              activeEngine.value = previousEngine; // 状态回滚给 UI
-              if (wasPlaying) await executePlayLogic(false); // 恢复原引擎播放
-              isEngineSwitching.value = false; // 解锁
+              activeEngine.value = previousEngine;
+              if (wasPlaying) await executePlayLogic(false);
+              isEngineSwitching.value = false;
               return 'DOWNLOADING';
           }
           
@@ -162,29 +181,176 @@ export const usePlayerStore = defineStore('player', () => {
               activeEngine.value = engineId;
               
               if (currentTrack.value) {
-                  // 🔥 魔术修复：强行把音频按在水底，等接回进度条再拉上来
                   await invoke('player_set_volume', { vol: 0.0 });
                   await invoke('player_load_track', { path: currentTrack.value.path });
                   await invoke('player_seek', { time: savedTime });
                   
+                  await invoke('player_set_volume', { vol: Math.max(0.01, volume.value / 100.0) });
+
                   if (wasPlaying) {
-                      await executePlayLogic(false); // 内部含有延迟的 set_volume 和 play
+                      await executePlayLogic(false); 
                   } else {
-                      await invoke('player_set_volume', { vol: volume.value / 100.0 });
                       await invoke('player_pause');
                   }
               }
+              
               isEngineSwitching.value = false;
+              // 🔥 修复关键 3：全部重载完毕，并且成功发声后，才开始结算冷却时间！
+              startCoolingTimer(); 
               return 'SUCCESS';
           }
           throw new Error("Invalid response");
       } catch (e: any) {
-          console.error(e);
-          notifyUI.value?.(`切换失败: ${e}`, 'error');
+          notifyUI.value?.(`SWITCH FAILED: ${e}`, 'error');
           await syncEngine();
           isEngineSwitching.value = false;
           return 'FAILED';
       }
+  };
+
+  const executePlayLogic = async (isNewTrack: boolean) => {
+      try {
+        if (isNewTrack) await invoke('player_set_volume', { vol: Math.max(0.01, volume.value / 100.0) });
+        await invoke('player_play');
+        isPlaying.value = true;
+        isPaused.value = false;
+        if (!hasStarted.value) hasStarted.value = true;
+        startProgressLoop(); 
+      } catch (e) { console.error(e); }
+  };
+
+  const executePauseLogic = async () => {
+      try {
+          await invoke('player_pause');
+          isPlaying.value = false;
+          isPaused.value = true;
+          stopProgressLoop();
+      } catch (e) { console.error(e); }
+  };
+
+  const togglePlay = () => {
+    if (!currentTrack.value) return;
+
+    if (isTrackSwitching.value || isSeeking.value || isBuffering.value) return;
+
+    if (!isPlaying.value && !hasStarted.value) {
+        performTrackSwitch(() => {});
+        return;
+    }
+
+    const intentToPlay = !isPlaying.value; 
+    isPlaying.value = intentToPlay;
+    isPaused.value = !intentToPlay; 
+    
+    if (actionTimeoutId) clearTimeout(actionTimeoutId);
+    actionTimeoutId = setTimeout(async () => {
+        if (intentToPlay) await executePlayLogic(false);
+        else await executePauseLogic();
+    }, 50);
+  };
+
+  const loadAndPlay = async (): Promise<void> => {
+    if (!currentTrack.value) return;
+    playSessionId.value++;
+    
+    isPlaying.value = true;
+    isPaused.value = false;
+    currentTime.value = 0;
+    progress.value = 0;
+    stopProgressLoop();
+
+    const mySession = playSessionId.value;
+
+    return new Promise((resolve) => {
+        if (actionTimeoutId) clearTimeout(actionTimeoutId);
+        actionTimeoutId = setTimeout(async () => {
+            let bufferTimeout = setTimeout(() => { isBuffering.value = true; }, 150);
+
+            try {
+                if (!hasAudioInitialized.value && activeDevice.value !== 'Default') {
+                    await invoke('set_output_device', { device: activeDevice.value });
+                    hasAudioInitialized.value = true;
+                }
+
+                const duration = await invoke<number>('player_load_track', { path: currentTrack.value!.path });
+                
+                clearTimeout(bufferTimeout); 
+
+                if (mySession !== playSessionId.value) {
+                    isBuffering.value = false;
+                    resolve();
+                    return;
+                }
+                
+                if (duration > 0.1) currentTrack.value!.duration = duration;
+                isBuffering.value = false;
+                await executePlayLogic(true);
+            } catch (e) {
+                clearTimeout(bufferTimeout);
+                if (mySession === playSessionId.value) {
+                    isPlaying.value = false;
+                    isBuffering.value = false;
+                    notifyUI.value?.("PLAY FAILED", "error");
+                }
+            }
+            resolve();
+        }, 50);
+    });
+  };
+
+  const performTrackSwitch = async (updateIndexFn: () => void) => {
+      if (isTrackSwitching.value) return;
+      isTrackSwitching.value = true; 
+      
+      const isFirstPlay = !hasStarted.value;
+      const delay = isFirstPlay ? 0 : 450;
+      const wasPlaying = isPlaying.value;
+      
+      if (wasPlaying && !isFirstPlay) {
+          await executePauseLogic(); 
+      }
+      
+      if (delay > 0) {
+          setTimeout(async () => {
+              updateIndexFn();
+              await loadAndPlay();
+              isTrackSwitching.value = false; 
+          }, delay);
+      } else {
+          updateIndexFn();
+          await loadAndPlay();
+          isTrackSwitching.value = false; 
+      }
+  };
+
+  const nextTrack = async () => { 
+      if(queue.value.length === 0) return; 
+      await performTrackSwitch(() => {
+          if (playMode.value === 'shuffle') {
+              const total = queue.value.length;
+              if (total > 1) {
+                  const seed = (Date.now() ^ (currentIndex.value * 123456789));
+                  const chaos = Math.abs(Math.sin(seed) * 100000.0);
+                  let targetIndex = Math.floor((chaos - Math.floor(chaos)) * total);
+                  if (targetIndex === currentIndex.value) targetIndex = (targetIndex + 1) % total;
+                  currentIndex.value = targetIndex;
+              }
+          } else {
+              currentIndex.value = (currentIndex.value + 1) % queue.value.length; 
+          }
+      });
+  };
+
+  const prevTrack = async () => { 
+      if(queue.value.length === 0) return; 
+      await performTrackSwitch(() => {
+          currentIndex.value = currentIndex.value > 0 ? currentIndex.value - 1 : queue.value.length - 1; 
+      });
+  };
+
+  const playTrack = async (track: Track) => { 
+      const idx = queue.value.indexOf(track); 
+      if (idx !== -1) { await performTrackSwitch(() => { currentIndex.value = idx; }); } 
   };
 
   const toggleLike = (track: Track) => {
@@ -200,110 +366,13 @@ export const usePlayerStore = defineStore('player', () => {
       availableDevices.value = ['Default', ...realDevices];
     } catch (e) { availableDevices.value = ['Default']; } 
   };
-
-  const executePlayLogic = async (isNewTrack: boolean) => {
-      try {
-        if (isNewTrack) await invoke('player_set_volume', { vol: volume.value / 100.0 });
-        if (!isNewTrack) await invoke('player_play');
-
-        isPlaying.value = true;
-        isPaused.value = false;
-        if (!hasStarted.value) hasStarted.value = true;
-        startProgressLoop(); 
-        // 延迟执行音量推子，完美掩盖加载噪音
-        setTimeout(() => { invoke('player_set_volume', { vol: volume.value / 100.0 }); }, 100);
-      } catch (e) { console.error(e); }
-  };
-
-  const executePauseLogic = async () => {
-      try {
-          await invoke('player_pause');
-          isPlaying.value = false;
-          isPaused.value = true;
-          stopProgressLoop();
-      } catch (e) { console.error(e); }
-  };
-
-  const togglePlay = () => {
-    if (!currentTrack.value) return;
-    const intentToPlay = !isPlaying.value; 
-    isPlaying.value = intentToPlay;
-    isPaused.value = !intentToPlay; 
-    
-    if (actionTimeoutId) clearTimeout(actionTimeoutId);
-    actionTimeoutId = setTimeout(async () => {
-        if (intentToPlay) await executePlayLogic(false);
-        else await executePauseLogic();
-    }, 50);
-  };
-
-  const loadAndPlay = async () => {
-    if (!currentTrack.value) return;
-    playSessionId.value++;
-    
-    isPlaying.value = true;
-    isPaused.value = false;
-    isBuffering.value = true;
-    currentTime.value = 0;
-    progress.value = 0;
-    stopProgressLoop();
-
-    const mySession = playSessionId.value;
-
-    if (actionTimeoutId) clearTimeout(actionTimeoutId);
-    actionTimeoutId = setTimeout(async () => {
-        try {
-            if (!hasAudioInitialized.value) {
-                await invoke('set_output_device', { device: activeDevice.value });
-                hasAudioInitialized.value = true;
-            }
-
-            const duration = await invoke<number>('player_load_track', { path: currentTrack.value!.path });
-            if (mySession !== playSessionId.value) return;
-            if (duration > 0.1) currentTrack.value!.duration = duration;
-            isBuffering.value = false;
-            await executePlayLogic(true);
-        } catch (e) {
-            if (mySession === playSessionId.value) {
-                isPlaying.value = false;
-                isBuffering.value = false;
-                notifyUI.value?.("PLAY FAILED", "error");
-            }
-        }
-    }, 50);
-  };
-
-  const nextTrack = async () => { 
-      if(queue.value.length === 0) return; 
-      if (playMode.value === 'shuffle') {
-          const total = queue.value.length;
-          if (total > 1) {
-              const seed = (Date.now() ^ (currentIndex.value * 123456789));
-              const chaos = Math.abs(Math.sin(seed) * 100000.0);
-              let targetIndex = Math.floor((chaos - Math.floor(chaos)) * total);
-              if (targetIndex === currentIndex.value) targetIndex = (targetIndex + 1) % total;
-              currentIndex.value = targetIndex;
-          }
-      } else {
-          currentIndex.value = (currentIndex.value + 1) % queue.value.length; 
-      }
-      await loadAndPlay(); 
-  };
-
-  const prevTrack = async () => { 
-      if(queue.value.length === 0) return; 
-      currentIndex.value = currentIndex.value > 0 ? currentIndex.value - 1 : queue.value.length - 1; 
-      await loadAndPlay(); 
-  };
-
-  const playTrack = (track: Track) => { const idx = queue.value.indexOf(track); if (idx !== -1) { currentIndex.value = idx; loadAndPlay(); } };
   const toggleMode = () => { const modes: PlayMode[] = ['sequence', 'loop', 'shuffle']; playMode.value = modes[(modes.indexOf(playMode.value) + 1) % modes.length]; };
 
   const performWithStateCheck = async (action: () => Promise<void>) => {
       const wasPaused = isPaused.value || !isPlaying.value;
       await action();
       if (wasPaused) { await invoke('player_pause'); } 
-      else { await invoke('player_set_volume', { vol: volume.value / 100.0 }); }
+      else { await invoke('player_set_volume', { vol: Math.max(0.01, volume.value / 100.0) }); }
   };
 
   const setOutputDevice = async (device: string) => {
@@ -327,17 +396,31 @@ export const usePlayerStore = defineStore('player', () => {
 
   const seekTo = async (percent: number) => {
     if (!currentTrack.value || currentTrack.value.duration <= 0) return;
+    if (isTrackSwitching.value || isSeeking.value) return; 
+
     const wasPlaying = isPlaying.value && !isPaused.value;
-    stopProgressLoop(); 
+    
     isSeeking.value = true; 
+    stopProgressLoop(); 
+    
+    isPlaying.value = false;
+    isPaused.value = true;
+    
     const targetTime = (percent / 100) * currentTrack.value.duration;
     progress.value = percent; 
     currentTime.value = targetTime;
+    
     try {
       await invoke('player_seek', { time: targetTime });
-      isSeeking.value = false; 
-      if (wasPlaying) startProgressLoop();
-    } catch (e) { isSeeking.value = false; }
+    } catch (e) {}
+
+    isSeeking.value = false; 
+
+    if (wasPlaying) {
+        isPlaying.value = true;
+        isPaused.value = false;
+        startProgressLoop();
+    }
   };
 
   const setupEventListeners = async () => {
@@ -357,10 +440,20 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const importTracks = async () => { await setupEventListeners(); try { await invoke('import_music'); } catch(e){} };
-  const initCheck = async () => { await setupEventListeners(); for (const track of queue.value) { try { await invoke('check_file_exists', { path: track.path }); track.isAvailable = true; } catch(e){ track.isAvailable = false; } } };
+  
+  const initCheck = async () => { 
+      await setupEventListeners(); 
+      queue.value.forEach(track => {
+          invoke('check_file_exists', { path: track.path })
+            .then((exists) => { track.isAvailable = exists as boolean; })
+            .catch(() => { track.isAvailable = false; });
+      });
+  };
 
   let rafId: number | null = null;
   let lastFrameTime = 0;
+  let listenersBound = false;
+
   const startProgressLoop = () => {
     stopProgressLoop();
     lastFrameTime = performance.now();
@@ -371,8 +464,13 @@ export const usePlayerStore = defineStore('player', () => {
       if (!isDragging.value && !isBuffering.value && !isSeeking.value) {
           currentTime.value += deltaTime;
           if (currentTime.value >= currentTrack.value.duration) {
-             if (playMode.value === 'loop') { currentTime.value = 0; invoke('player_seek', { time: 0.0 }); } 
-             else { nextTrack(); return; }
+             if (playMode.value === 'loop') { 
+                 currentTime.value = 0; 
+                 invoke('player_seek', { time: 0.0 }); 
+             } else { 
+                 nextTrack(); 
+                 return; 
+             }
           }
           if (currentTrack.value.duration > 0) progress.value = (currentTime.value / currentTrack.value.duration) * 100;
       }
@@ -382,15 +480,13 @@ export const usePlayerStore = defineStore('player', () => {
   };
   const stopProgressLoop = () => { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } };
 
-  let listenersBound = false;
-
   watch(volume, (v) => { invoke('player_set_volume', { vol: v / 100.0 }); });
 
   return { 
     isPlaying, isPaused, hasStarted, volume, progress, currentTime, playMode, queue, currentIndex, currentTrack, activeEngine, showPlaylist, 
     isDragging, isBuffering, isSeeking, 
     isDownloadingFFmpeg, ffmpegProgress, 
-    hasAudioInitialized, 
+    hasAudioInitialized, isSmtcEnabled, engineCoolingRemaining,
     likedTracks, likedQueue, availableDevices, activeDevice, 
     togglePlay, nextTrack, prevTrack, seekTo, switchEngine, loadAndPlay, initCheck, setNotifier, importTracks, 
     togglePlaylist, toggleMode, toggleLike, isLiked, fetchDevices, setOutputDevice, playTrack, setChannelMode 

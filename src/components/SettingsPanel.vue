@@ -7,7 +7,8 @@ import {
   Loader2, AlertCircle, CheckCircle2, Speaker 
 } from 'lucide-vue-next';
 
-const emit = defineEmits<{ (e: 'close'): void; (e: 'notify', text: string, type?: 'info' | 'error'): void; }>();
+// 🔥 支持接收 cooling 类型
+const emit = defineEmits<{ (e: 'close'): void; (e: 'notify', text: string, type?: 'info' | 'error' | 'cooling'): void; }>();
 const player = usePlayerStore();
 
 const activeSettingTab = ref('core');
@@ -25,15 +26,32 @@ const engines = [
 const selectEngine = async (id: string) => {
   if (engineState.value === 'switching' || player.activeEngine === id) return;
   if (id === 'ffmpeg' && player.isDownloadingFFmpeg) { emit('notify', 'FFMPEG IS CURRENTLY DOWNLOADING', 'error'); return; }
+  
+  // 🔥 终极预判拦截：在这里直接弹雪花提示，不往下执行，防止 FAILED 覆盖！
+  if (player.engineCoolingRemaining > 0) {
+      targetEngineId.value = id;
+      engineState.value = 'failed';
+      emit('notify', `SYSTEM COOLING: ${player.engineCoolingRemaining}S`, 'cooling');
+      setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000);
+      return;
+  }
+
   targetEngineId.value = id; engineState.value = 'switching'; emit('notify', `INITIALIZING ${id.toUpperCase()}...`);
   const result = await player.switchEngine(id);
   if (result === 'SUCCESS') { engineState.value = 'success'; emit('notify', `${id.toUpperCase()} ENGINE READY`); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500); } 
   else if (result === 'DOWNLOADING') { engineState.value = 'idle'; targetEngineId.value = ''; } 
+  else if (result === 'COOLING') { engineState.value = 'failed'; setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
   else { engineState.value = 'failed'; emit('notify', `FAILED TO LOAD ${id.toUpperCase()}`, 'error'); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
 };
 
 const setChannel = (ch: number) => { currentChannel.value = ch; player.setChannelMode(ch); emit('notify', `AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`); };
 const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as HTMLSelectElement).value); };
+
+const toggleSMTC = () => {
+    player.isSmtcEnabled = !player.isSmtcEnabled;
+    localStorage.setItem('smtc_enabled', JSON.stringify(player.isSmtcEnabled));
+    emit('notify', player.isSmtcEnabled ? 'NATIVE SMTC ENABLED' : 'NATIVE SMTC DISABLED');
+};
 </script>
 
 <template>
@@ -51,6 +69,7 @@ const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as H
       
       <div class="flex-1 h-full overflow-hidden p-10 relative z-10">
         <Transition name="slide-up-fade" mode="out-in">
+          
           <div v-if="activeSettingTab === 'core'" class="h-full overflow-y-auto scrollbar-hide max-w-4xl mx-auto">
             <div class="mb-8 flex items-end justify-between">
                 <div><h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3><p class="text-sm text-white/40">Select the audio core driver for signal processing.</p></div>
@@ -90,6 +109,7 @@ const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as H
           <div v-else-if="activeSettingTab === 'audio'" class="h-full overflow-y-auto scrollbar-hide max-w-4xl mx-auto">
               <h3 class="text-2xl font-bold text-white mb-2">Audio Channels</h3>
               <p class="text-sm text-white/40 mb-8">Configure output mapping for surround sound systems.</p>
+
               <div class="mb-8 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20">
                   <label class="text-xs font-bold text-starlight-cyan tracking-widest mb-3 block">OUTPUT DEVICE</label>
                   <select @change="selectOutputDevice" class="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white text-sm focus:border-starlight-cyan outline-none transition-colors duration-300"><option v-for="dev in player.availableDevices" :key="dev" :value="dev" :selected="player.activeDevice === dev">{{ dev }}</option></select>
@@ -100,7 +120,32 @@ const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as H
                   <button @click="setChannel(8)" class="p-6 rounded-2xl border flex flex-col items-center gap-4 transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] active:scale-95 no-drag-btn outline-none" :class="currentChannel === 8 ? 'bg-starlight-cyan/15 border-starlight-cyan text-white shadow-[0_0_20px_rgba(100,255,218,0.15)] scale-105' : 'bg-white/5 border-white/5 text-white/40 hover:bg-white/10 hover:scale-[1.02]'"><Speaker :size="32" class="transition-transform duration-400" :class="currentChannel === 8 ? 'scale-110' : ''" /><span class="font-bold tracking-widest text-xs">SURROUND (7.1)</span></button>
               </div>
           </div>
-           <div v-else-if="activeSettingTab === 'display'" class="h-full flex flex-col items-center justify-center opacity-30 transition-opacity duration-700 hover:opacity-80"><Monitor :size="48" class="mb-4 text-white animate-pulse-slow"/><p class="text-white font-mono tracking-widest">HOLOGRAM UI CALIBRATION REQUIRED</p></div>
+          
+           <div v-else-if="activeSettingTab === 'display'" class="h-full overflow-y-auto scrollbar-hide max-w-4xl mx-auto">
+               <h3 class="text-2xl font-bold text-white mb-2">Hologram UI & System Integration</h3>
+               <p class="text-sm text-white/40 mb-8">Configure system-level UI integrations and display features.</p>
+               
+               <div class="mb-6 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20 flex items-center justify-between">
+                  <div>
+                      <h4 class="text-white font-bold tracking-widest text-sm">NATIVE WINDOWS SMTC</h4>
+                      <p class="text-[10px] text-white/40 mt-1 uppercase">Sync track metadata to system media overlay.</p>
+                  </div>
+                  <button 
+                      @click="toggleSMTC"
+                      class="w-12 h-6 rounded-full transition-all duration-500 relative no-drag-btn outline-none"
+                      :class="player.isSmtcEnabled ? 'bg-starlight-cyan' : 'bg-white/10'"
+                  >
+                      <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all duration-500"
+                           :class="player.isSmtcEnabled ? 'left-7' : 'left-1'"></div>
+                  </button>
+              </div>
+
+              <div class="mt-20 flex flex-col items-center justify-center opacity-30 pointer-events-none">
+                  <Monitor :size="48" class="mb-4 text-white animate-pulse-slow"/>
+                  <p class="text-white font-mono tracking-widest text-xs">MORE UI SETTINGS COMING SOON...</p>
+              </div>
+           </div>
+
         </Transition>
       </div>
     </div>
@@ -110,12 +155,8 @@ const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as H
 <style scoped>
 .scrollbar-hide::-webkit-scrollbar { display: none; }
 .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
-
-/* 鸿蒙风格整体面板淡入 */
 .panel-fade-enter-active, .panel-fade-leave-active { transition: opacity 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .panel-fade-enter-from, .panel-fade-leave-to { opacity: 0; }
-
-/* 面板内 Tab 切换动画 */
 .slide-up-fade-enter-active { transition: all 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .slide-up-fade-leave-active { transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .slide-up-fade-enter-from { transform: translateY(20px) scale(0.98); opacity: 0; filter: blur(4px); }

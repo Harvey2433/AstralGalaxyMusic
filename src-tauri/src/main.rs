@@ -44,7 +44,10 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
     let interop: ISystemMediaTransportControlsInterop = windows::core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
     let smtc: SystemMediaTransportControls = unsafe { interop.GetForWindow(hwnd) }?;
     
-    // 2. 获取 DisplayUpdater 并【必须】设置类型为 Music (梦梦姐发现的核心坑点！) 
+    // 🔥 保证如果之前被禁用了，这次更新能把它强制叫醒
+    smtc.SetIsEnabled(true)?;
+
+    // 2. 获取 DisplayUpdater 并【必须】设置类型为 Music
     let updater = smtc.DisplayUpdater()?;
     updater.SetType(MediaPlaybackType::Music)?; 
 
@@ -71,6 +74,44 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
 
     // 5. 提交更新到系统面板 
     updater.Update()?;
+    Ok(())
+}
+
+// ============================================================
+// 🔥 新增：彻底控制 SMTC 消失/显示的核心指令
+// ============================================================
+#[tauri::command]
+async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
+        use windows::Media::SystemMediaTransportControls;
+        use windows::core::Interface;
+
+        let hwnd = HWND(handle.hwnd_ptr as *mut core::ffi::c_void);
+        if let Ok(interop) = windows::core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>() {
+            
+            // 🔥 修复 E0282 报错：明确指定 `smtc` 为 `SystemMediaTransportControls` 类型
+            let smtc_result: windows::core::Result<SystemMediaTransportControls> = unsafe { interop.GetForWindow(hwnd) };
+            
+            if let Ok(smtc) = smtc_result {
+                // 强制切断或恢复钩子
+                let _ = smtc.SetIsEnabled(enable);
+                
+                if !enable {
+                    // 如果是禁用，顺手清理一下里面的缓存残留
+                    if let Ok(updater) = smtc.DisplayUpdater() {
+                        let _ = updater.ClearAll();
+                        let _ = updater.Update();
+                    }
+                    log_smtc("[NATIVE] SMTC Hook completely disabled and hidden.");
+                } else {
+                    log_smtc("[NATIVE] SMTC Hook enabled.");
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -176,7 +217,8 @@ fn main() {
             player_load_track, player_play, player_pause, player_seek, player_set_volume,
             player_set_channels, get_output_devices, set_output_device,
             get_lyrics, get_current_engine,
-            sync_smtc_metadata, sync_smtc_status
+            sync_smtc_metadata, sync_smtc_status,
+            toggle_smtc_active // 🔥 新指令已注册
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
