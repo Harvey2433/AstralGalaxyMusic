@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "astralgalaxymusicplayer"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "base64 0.21.7",
  "biquad",
@@ -140,6 +140,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-shell",
+ "tokio",
  "url",
  "urlencoding",
  "windows 0.58.0",
@@ -5323,9 +5324,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.49.0"
+version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72a2903cd7736441aac9df9d7688bd0ce48edccaadf181c3b90be801e81d3d86"
+checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
  "bytes",
  "libc",

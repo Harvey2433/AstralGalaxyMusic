@@ -18,11 +18,14 @@ macro_rules! debug_log {
     })
 }
 
+// 🔥 新增：真实声道的标识 106 / 108
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChannelConfig {
     Stereo = 2,
     Surround51 = 6,
     Surround71 = 8,
+    True51 = 106,
+    True71 = 108,
 }
 
 // =========================================================
@@ -66,19 +69,31 @@ impl SpatialProcessor {
 pub struct UpmixSource<I: Source<Item = f32>> {
     input: I,
     pub target_channels: u16,
+    pub virtualize: bool, // 🔥 新增：虚拟降维标志
     current_frame: Vec<f32>,
     dsp: SpatialProcessor, 
 }
 
 impl<I: Source<Item = f32>> UpmixSource<I> {
-    pub fn new(input: I, target_channels: u16) -> Self {
+    pub fn new(input: I, config_code: u16) -> Self {
         let sample_rate = input.sample_rate();
-        Self { input, target_channels, current_frame: Vec::with_capacity(8), dsp: SpatialProcessor::new(sample_rate) }
+        // 🔥 解析魔法指令，决定是真的多声道还是耳机虚拟
+        let (target_channels, virtualize) = match config_code {
+            6 => (6, true),
+            8 => (8, true),
+            106 => (6, false),
+            108 => (8, false),
+            _ => (2, false),
+        };
+        Self { input, target_channels, virtualize, current_frame: Vec::with_capacity(8), dsp: SpatialProcessor::new(sample_rate) }
     }
     #[inline(always)]
     fn clamp(val: f32) -> f32 { val.max(-1.0).min(1.0) }
 }
 
+// =========================================================
+// 🔥 真环绕与虚拟声场分发矩阵
+// =========================================================
 impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
@@ -95,24 +110,37 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
             }
             
             let (lfe_raw, rear_l_raw, rear_r_raw) = self.dsp.process(l, r);
+            let center = (l + r) * 0.5;
             
-            let center = (l + r) * 0.4; 
-            let ambience = (l - r) * 0.3; 
-            let surround_l = rear_l_raw * 0.4 + ambience;
-            let surround_r = rear_r_raw * 0.4 - ambience; 
-            let lfe = lfe_raw * 1.2;
-
-            self.current_frame.push(Self::clamp(l)); 
-            self.current_frame.push(Self::clamp(r)); 
-            self.current_frame.push(Self::clamp(center)); 
-            self.current_frame.push(Self::clamp(lfe)); 
-            self.current_frame.push(Self::clamp(surround_l)); 
-            self.current_frame.push(Self::clamp(surround_r));
-            
-            if self.target_channels == 8 {
-                self.current_frame.push(Self::clamp(surround_l * 0.8)); 
-                self.current_frame.push(Self::clamp(surround_r * 0.8));
+            if self.virtualize {
+                // --- 🎧 Virtual 虚拟降维空间矩阵 (骗过大脑) ---
+                if self.target_channels == 6 {
+                    let mix_l = l * 0.75 + center * 0.3 + lfe_raw * 0.6 - rear_r_raw * 0.45;
+                    let mix_r = r * 0.75 + center * 0.3 + lfe_raw * 0.6 - rear_l_raw * 0.45;
+                    self.current_frame.push(Self::clamp(mix_l)); 
+                    self.current_frame.push(Self::clamp(mix_r)); 
+                } else {
+                    let mix_l = l * 0.65 + center * 0.3 + lfe_raw * 0.7 - rear_r_raw * 0.55 + rear_l_raw * 0.2;
+                    let mix_r = r * 0.65 + center * 0.3 + lfe_raw * 0.7 - rear_l_raw * 0.55 + rear_r_raw * 0.2;
+                    self.current_frame.push(Self::clamp(mix_l)); 
+                    self.current_frame.push(Self::clamp(mix_r)); 
+                }
+            } else {
+                // --- 🔊 真实物理多声道输出 (家庭影院满血火力) ---
+                let lfe = lfe_raw * 1.2;
+                self.current_frame.push(Self::clamp(l));          
+                self.current_frame.push(Self::clamp(r));          
+                self.current_frame.push(Self::clamp(center));     
+                self.current_frame.push(Self::clamp(lfe));        
+                self.current_frame.push(Self::clamp(rear_l_raw)); 
+                self.current_frame.push(Self::clamp(rear_r_raw)); 
+                
+                if self.target_channels == 8 {
+                    self.current_frame.push(Self::clamp(rear_l_raw * 0.8)); 
+                    self.current_frame.push(Self::clamp(rear_r_raw * 0.8)); 
+                }
             }
+            
             self.current_frame.reverse(); 
         }
         self.current_frame.pop()
@@ -121,7 +149,8 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
 
 impl<I: Source<Item = f32>> Source for UpmixSource<I> {
     fn current_frame_len(&self) -> Option<usize> { None }
-    fn channels(&self) -> u16 { self.target_channels }
+    // 🔥 虚拟时伪装 2 声道，真实模式老实输出多声道！
+    fn channels(&self) -> u16 { if self.virtualize { 2 } else { self.target_channels } } 
     fn sample_rate(&self) -> u32 { self.input.sample_rate() }
     fn total_duration(&self) -> Option<Duration> { self.input.total_duration() }
 }
@@ -259,6 +288,7 @@ impl AudioEngine for GalaxyEngine {
             }
             
             sink_guard.set_volume(self.get_volume());
+            // 🔥 这里强制将 ChannelConfig 转换回 u16 的魔法指令丢进解析器
             let mixed_source = UpmixSource::new(source.convert_samples::<f32>(), *self.channel_mode.read().unwrap() as u16);
             sink_guard.append(mixed_source);
             
@@ -311,7 +341,6 @@ impl AudioEngine for GalaxyEngine {
         let my_seek_session = self.seek_session.fetch_add(1, Ordering::SeqCst) + 1;
         let is_playing_now = self.is_playing.load(Ordering::SeqCst);
 
-        // 1. 物理斩断：前端一旦请求寻址，立马丢弃旧句柄，保持绝对死寂
         {
             let mut sink_guard = self.sink.lock().unwrap();
             if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
@@ -320,14 +349,13 @@ impl AudioEngine for GalaxyEngine {
             } else {
                 sink_guard.stop();
             }
-            sink_guard.pause(); // 强行把新句柄设为静默状态！
+            sink_guard.pause(); 
         }
 
-        // 2. 同步阻塞：挂起 Tauri 线程，让前端一直处于等待动画中
         let start_wait = Instant::now();
         while !self.is_decoded.load(Ordering::Acquire) {
             if self.seek_session.load(Ordering::SeqCst) != my_seek_session {
-                return; // 放弃旧任务
+                return; 
             }
             if start_wait.elapsed().as_secs() > 45 { 
                 debug_log!("Decode wait timed out.");
@@ -340,7 +368,6 @@ impl AudioEngine for GalaxyEngine {
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
         
-        // 3. 解压完成，装载新音频！
         let sink_guard = self.sink.lock().unwrap();
         if self.is_decoded.load(Ordering::Acquire) {
             if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
@@ -364,7 +391,6 @@ impl AudioEngine for GalaxyEngine {
             }
         }
         
-        // 4. 读取刚才备份的播放状态（绝对尊重前端），然后真正放出声音
         sink_guard.set_volume(self.get_volume());
         if is_playing_now { 
             sink_guard.play(); 
@@ -378,9 +404,14 @@ impl AudioEngine for GalaxyEngine {
         if let Ok(s) = self.sink.lock() { s.set_volume(vol); }
     }
 
+    // 🔥 解析前端设置模式
     fn set_channel_mode(&mut self, _mode: u16) {
         let config = match _mode {
-            6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, _ => ChannelConfig::Stereo,
+            6 => ChannelConfig::Surround51, 
+            8 => ChannelConfig::Surround71, 
+            106 => ChannelConfig::True51,
+            108 => ChannelConfig::True71,
+            _ => ChannelConfig::Stereo,
         };
         *self.channel_mode.write().unwrap() = config;
     }

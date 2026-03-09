@@ -14,7 +14,8 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
   notificationText.value = text; 
   notificationType.value = type; 
   isNotificationVisible.value = true;
-  setTimeout(() => { isNotificationVisible.value = false; }, type === 'error' ? 3000 : 2000);
+  // 错误提示停留时间长一点，方便梦梦姐看清
+  setTimeout(() => { isNotificationVisible.value = false; }, type === 'error' ? 4000 : 2000);
 };
 
 defineExpose({ notify });
@@ -26,19 +27,41 @@ const currentIslandMode = computed(() => {
   if (player.isDownloadingFFmpeg) return 'downloading';
   return 'idle';
 });
+
+// 🔥 核心魔法：动态计算灵动岛宽度
+const islandWidth = computed(() => {
+  if (currentIslandMode.value === 'idle') return '80px';
+  if (currentIslandMode.value === 'media') return '260px';
+  if (currentIslandMode.value === 'loading') return '110px';
+  if (currentIslandMode.value === 'downloading') return '160px';
+  if (currentIslandMode.value === 'notification') {
+    // 假设等宽字体每个字符大概占 8px，加上 padding 和 icon 的预留空间
+    const textWidth = notificationText.value.length * 8;
+    // 保证最小宽度 220px，如果字太多就自适应拉长
+    return Math.max(220, textWidth + 80) + 'px';
+  }
+  return '220px';
+});
+
+// 🔥 核心魔法：动态计算灵动岛高度
+const islandHeight = computed(() => {
+  if (currentIslandMode.value === 'idle') return '20px';
+  if (currentIslandMode.value === 'media') return '40px';
+  if (currentIslandMode.value === 'loading') return '32px';
+  return '36px'; // notification 和 downloading 状态
+});
 </script>
 
 <template>
   <div 
     class="fixed top-[32px] left-1/2 z-[100] flex items-center justify-center overflow-hidden bg-cosmos-950/70 backdrop-blur-xl border border-white/10 shadow-[0_10px_30px_rgba(0,0,0,0.5)] origin-center will-change-transform -translate-x-1/2 -translate-y-1/2"
-    style="transition: all 0.6s cubic-bezier(0.32, 0.72, 0, 1.25); border-radius: 999px;"
-    :class="[
-      currentIslandMode === 'idle' ? 'w-20 h-5 opacity-0 -mt-6 scale-90' : 'opacity-100 mt-0 scale-100',
-      currentIslandMode === 'media' ? 'w-[260px] h-[40px]' : '',
-      currentIslandMode === 'notification' ? 'w-[220px] h-[36px]' : '',
-      currentIslandMode === 'loading' ? 'w-[110px] h-[32px]' : '',
-      currentIslandMode === 'downloading' ? 'w-[160px] h-[36px]' : ''
-    ]"
+    :class="currentIslandMode === 'idle' ? 'opacity-0 -mt-6 scale-90' : 'opacity-100 mt-0 scale-100'"
+    :style="{
+      width: islandWidth,
+      height: islandHeight,
+      transition: 'all 0.6s cubic-bezier(0.32, 0.72, 0, 1.25)',
+      borderRadius: '999px'
+    }"
   >
      <div 
        class="absolute inset-0 flex items-center gap-2.5 px-2.5 transition-all duration-500 ease-out"
@@ -73,7 +96,7 @@ const currentIslandMode = computed(() => {
          :class="notificationType === 'error' ? 'text-red-500' : (notificationType === 'cooling' ? 'text-blue-400 animate-pulse' : 'text-starlight-cyan')" 
          class="shrink-0"
        />
-       <span class="text-[10px] font-mono font-bold tracking-widest truncate min-w-0" :class="notificationType === 'cooling' ? 'text-blue-300' : 'text-white'">
+       <span class="text-[10px] font-mono font-bold tracking-widest whitespace-nowrap" :class="notificationType === 'cooling' ? 'text-blue-300' : 'text-white'">
          {{ notificationText }}
        </span>
      </div>
@@ -91,7 +114,7 @@ const currentIslandMode = computed(() => {
        :class="currentIslandMode === 'downloading' ? 'opacity-100 scale-100 delay-100' : 'opacity-0 scale-95 pointer-events-none'"
      >
        <DownloadCloud :size="16" class="text-yellow-400 animate-pulse shrink-0" />
-       <span class="text-[10px] font-mono font-bold tracking-widest text-yellow-400 truncate min-w-0">FETCHING CORE</span>
+       <span class="text-[10px] font-mono font-bold tracking-widest text-yellow-400 truncate min-w-0">Downloading</span>
      </div>
 
      <div 

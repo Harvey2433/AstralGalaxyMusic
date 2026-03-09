@@ -4,6 +4,7 @@ use super::AudioEngine;
 use std::process::{Command, Stdio};
 use std::path::{Path, PathBuf};
 use std::fs;
+use tokio::time::timeout;
 use std::env;
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,7 +19,7 @@ use rodio::{OutputStreamHandle, Sink, Source, buffer::SamplesBuffer};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-// 🔥 复用 Galaxy 的超级安全上混模块
+// 🔥 复用 Galaxy 的超级安全上混模块与配置
 use super::galaxy::{UpmixSource, ChannelConfig};
 
 pub struct FFmpegEngine {
@@ -90,19 +91,54 @@ impl FFmpegEngine {
         
         if url.is_empty() { return Err("Auto-download currently only supports Windows.".to_string()); }
 
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10)) 
+            .build()
+            .map_err(|e| format!("构建下载客户端失败: {}", e))?;
+
+        match client.head(url).send().await {
+            Ok(resp) if resp.status().is_success() => {},
+            Ok(resp) => {
+                let _ = window.emit("ffmpeg-status", "error");
+                return Err(format!("下载源不可达: {}", resp.status()));
+            },
+            Err(e) => {
+                let _ = window.emit("ffmpeg-status", "error");
+                return Err(format!("网络无法访问: {}", e));
+            }
+        }
+
         window.emit("ffmpeg-status", "downloading").unwrap();
-        let client = reqwest::Client::new();
-        let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
+        let mut response = client.get(url).send().await.map_err(|e| format!("建立下载流失败: {}", e))?;
+        
         let total_size = response.content_length().unwrap_or(0);
         let mut downloaded: u64 = 0;
         let mut chunks = Vec::new();
+        let chunk_timeout = Duration::from_secs(15); 
 
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-            downloaded += chunk.len() as u64;
-            chunks.extend_from_slice(&chunk);
-            if total_size > 0 { 
-                let percent = (downloaded as f64 / total_size as f64) * 90.0;
-                let _ = window.emit("ffmpeg-progress", percent); 
+        loop {
+            match timeout(chunk_timeout, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    downloaded += chunk.len() as u64;
+                    chunks.extend_from_slice(&chunk);
+                    if total_size > 0 { 
+                        let percent = (downloaded as f64 / total_size as f64) * 90.0;
+                        let _ = window.emit("ffmpeg-progress", percent); 
+                    }
+                },
+                Ok(Ok(None)) => {
+                    break;
+                },
+                Ok(Err(e)) => {
+                    chunks.clear(); 
+                    let _ = window.emit("ffmpeg-status", "cooling"); 
+                    return Err(format!("传输异常中断: {}", e));
+                },
+                Err(_) => {
+                    chunks.clear(); 
+                    let _ = window.emit("ffmpeg-status", "cooling"); 
+                    return Err("数据流卡死，已触发引擎冷却保护机制".to_string());
+                }
             }
         }
         
@@ -110,7 +146,7 @@ impl FFmpegEngine {
         let _ = window.emit("ffmpeg-progress", 95.0);
         
         let cursor = Cursor::new(chunks);
-        let mut archive = ZipArchive::new(cursor).map_err(|e| e.to_string())?;
+        let mut archive = ZipArchive::new(cursor).map_err(|e| format!("解压失败: {}", e))?;
         
         let mut extracted = false;
         for i in 0..archive.len() {
@@ -133,7 +169,7 @@ impl FFmpegEngine {
             Ok(()) 
         } else { 
             let _ = window.emit("ffmpeg-status", "error"); 
-            Err("Verification failed".to_string()) 
+            Err("FFmpeg 核心校验失败，请重试".to_string()) 
         }
     }
 
@@ -203,7 +239,6 @@ impl AudioEngine for FFmpegEngine {
 
         let ffmpeg_exe = Self::get_ffmpeg_exe();
         
-        // 🔥 重新构造 Command 对象
         let mut cmd = Command::new(&ffmpeg_exe);
         cmd.args(&[
             "-i", path, "-f", "f32le", "-ac", "2", "-ar", "44100", 
@@ -211,7 +246,6 @@ impl AudioEngine for FFmpegEngine {
         ])
         .stdout(Stdio::piped());
 
-        // 🔥 魔法注入：彻底杀死播放切歌时的 CMD 弹窗
         #[cfg(target_os = "windows")]
         {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -300,9 +334,14 @@ impl AudioEngine for FFmpegEngine {
         }
     }
 
+    // 🔥 解析前端传参：兼容真实的物理 106 / 108 模式
     fn set_channel_mode(&mut self, _mode: u16) {
         let config = match _mode {
-            6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, _ => ChannelConfig::Stereo,
+            6 => ChannelConfig::Surround51, 
+            8 => ChannelConfig::Surround71, 
+            106 => ChannelConfig::True51,
+            108 => ChannelConfig::True71,
+            _ => ChannelConfig::Stereo,
         };
         *self.channel_mode.write().unwrap() = config;
     }

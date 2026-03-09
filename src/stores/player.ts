@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
-const DEFAULT_COVER = 'https://images.unsplash.com/photo-1614728853913-6591d801d643?q=80&w=400&auto=format&fit=crop';
+const DEFAULT_COVER = 'https://picui.ogmua.cn/s1/2026/03/09/69aeb0db3989e.webp';
 
 export interface Track {
   id: string; title: string; artist: string; album: string; cover: string; duration: number; path: string; isAvailable?: boolean; 
@@ -37,9 +37,13 @@ export const usePlayerStore = defineStore('player', () => {
   const lastEngineSwitchTime = ref(0);
   const engineCoolingRemaining = ref(0);
 
+  // 🔥 新增：从本地存储读取声道设置并保持响应式
+  const channelMode = ref(Number(localStorage.getItem('channel_mode') || '2'));
+  const isTrueSurround = ref(JSON.parse(localStorage.getItem('true_surround') || 'false'));
+
   const isTrackSwitching = ref(false);
   let actionTimeoutId: any = null;
-  let coolingTimerId: any = null; // 独立保存冷却计时器的引用，防止冲突
+  let coolingTimerId: any = null;
 
   const likedTracks = ref<Set<string>>(new Set(JSON.parse(localStorage.getItem('liked_tracks') || '[]')));
   const availableDevices = ref<string[]>([]);
@@ -62,10 +66,9 @@ export const usePlayerStore = defineStore('player', () => {
       } catch (e) { console.error("Sync Engine Failed:", e); }
   };
 
-  // 🔥 修复关键 1：重新封装的极严谨计时器，真正从调用这一刻开始算冷却！
   const startCoolingTimer = () => {
-      if (coolingTimerId) clearInterval(coolingTimerId); // 清除可能存在的旧计时器
-      lastEngineSwitchTime.value = Date.now(); // 记录切换成功的那一刻
+      if (coolingTimerId) clearInterval(coolingTimerId); 
+      lastEngineSwitchTime.value = Date.now(); 
       engineCoolingRemaining.value = 30;
 
       coolingTimerId = setInterval(() => {
@@ -92,11 +95,11 @@ export const usePlayerStore = defineStore('player', () => {
           } else if (status === 'extracting') { 
               isDownloadingFFmpeg.value = true;
               ffmpegProgress.value = 99;
-              notifyUI.value?.('EXTRACTING COMPONENTS...', 'info');
+              notifyUI.value?.('EXTRACTING CORE...', 'info');
           } else if (status === 'ready') { 
               isDownloadingFFmpeg.value = false;
               ffmpegProgress.value = 100;
-              notifyUI.value?.('FFMPEG READY. INITIALIZING...');
+              notifyUI.value?.('CORE DEPLOYED');
               
               const savedTime = currentTime.value;
               const wasPlaying = isPlaying.value;
@@ -117,23 +120,27 @@ export const usePlayerStore = defineStore('player', () => {
 
                           if (wasPlaying) {
                               await executePlayLogic(false); 
-                              notifyUI.value?.('FFMPEG ONLINE. RESUMING.');
+                              notifyUI.value?.('FFMPEG ONLINE');
                           } else {
                               await invoke('player_pause');
                           }
                       }
-                      
-                      // 🔥 修复关键 2：漫长的下载和解压完全结束后，在此刻才开始 30 秒倒计时！
                       startCoolingTimer();
                   }
               } catch (err) {
-                  notifyUI.value?.('FFMPEG FAILED TO LOAD', 'error');
+                  notifyUI.value?.('FFMPEG FAILED', 'error');
               } finally {
                   isEngineSwitching.value = false;
               }
+          } else if (status === 'cooling') {
+              isDownloadingFFmpeg.value = false;
+              isEngineSwitching.value = false;
+              startCoolingTimer();
+              notifyUI.value?.('SYS COOLING...', 'cooling');
           } else if (status === 'error') {
               isDownloadingFFmpeg.value = false;
-              notifyUI.value?.('DOWNLOAD FAILED. CHECK NETWORK.', 'error');
+              isEngineSwitching.value = false; 
+              notifyUI.value?.('DOWNLOAD ERROR', 'error');
           }
       });
 
@@ -142,12 +149,15 @@ export const usePlayerStore = defineStore('player', () => {
   });
 
   const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED' | 'COOLING'> => {
-      if (isDownloadingFFmpeg.value || isEngineSwitching.value) return 'FAILED';
+      if (isDownloadingFFmpeg.value || isEngineSwitching.value || isSeeking.value || isBuffering.value || isDragging.value) {
+          notifyUI.value?.('SYS BUSY', 'error');
+          return 'FAILED';
+      }
       
       const now = Date.now();
       if (now - lastEngineSwitchTime.value < 30000) {
           const remaining = Math.ceil(30 - (now - lastEngineSwitchTime.value) / 1000);
-          notifyUI.value?.(`SYSTEM COOLING: ${remaining}S`, 'cooling');
+          notifyUI.value?.(`COOLING: ${remaining}S`, 'cooling');
           return 'COOLING';
       }
       
@@ -155,7 +165,7 @@ export const usePlayerStore = defineStore('player', () => {
       if (previousEngine === engineId) return 'SUCCESS';
       
       isEngineSwitching.value = true;
-      notifyUI.value?.(`INITIALIZING ${engineId.toUpperCase()}...`);
+      notifyUI.value?.(`INIT ${engineId.toUpperCase()}...`);
       
       try {
           const savedTime = currentTime.value;
@@ -172,7 +182,6 @@ export const usePlayerStore = defineStore('player', () => {
               isDownloadingFFmpeg.value = true;
               activeEngine.value = previousEngine;
               if (wasPlaying) await executePlayLogic(false);
-              isEngineSwitching.value = false;
               return 'DOWNLOADING';
           }
           
@@ -195,15 +204,14 @@ export const usePlayerStore = defineStore('player', () => {
               }
               
               isEngineSwitching.value = false;
-              // 🔥 修复关键 3：全部重载完毕，并且成功发声后，才开始结算冷却时间！
               startCoolingTimer(); 
               return 'SUCCESS';
           }
           throw new Error("Invalid response");
       } catch (e: any) {
-          notifyUI.value?.(`SWITCH FAILED: ${e}`, 'error');
+          notifyUI.value?.(`SWITCH ERROR`, 'error');
           await syncEngine();
-          isEngineSwitching.value = false;
+          isEngineSwitching.value = false; 
           return 'FAILED';
       }
   };
@@ -229,8 +237,9 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const togglePlay = () => {
-    if (!currentTrack.value) return;
+    if (isEngineSwitching.value || isDownloadingFFmpeg.value) return; 
 
+    if (!currentTrack.value) return;
     if (isTrackSwitching.value || isSeeking.value || isBuffering.value) return;
 
     if (!isPlaying.value && !hasStarted.value) {
@@ -299,6 +308,8 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const performTrackSwitch = async (updateIndexFn: () => void) => {
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return; 
+
       if (isTrackSwitching.value) return;
       isTrackSwitching.value = true; 
       
@@ -369,6 +380,8 @@ export const usePlayerStore = defineStore('player', () => {
   const toggleMode = () => { const modes: PlayMode[] = ['sequence', 'loop', 'shuffle']; playMode.value = modes[(modes.indexOf(playMode.value) + 1) % modes.length]; };
 
   const performWithStateCheck = async (action: () => Promise<void>) => {
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return; 
+
       const wasPaused = isPaused.value || !isPlaying.value;
       await action();
       if (wasPaused) { await invoke('player_pause'); } 
@@ -387,14 +400,23 @@ export const usePlayerStore = defineStore('player', () => {
     });
   };
 
-  const setChannelMode = async (mode: number) => {
+  // 🔥 修复：将状态保存到 Pinia 和 localStorage，实现永久记忆
+  const setChannelMode = async (mode: number, trueSurround: boolean = false) => {
+      channelMode.value = mode;
+      isTrueSurround.value = trueSurround;
+      localStorage.setItem('channel_mode', mode.toString());
+      localStorage.setItem('true_surround', JSON.stringify(trueSurround));
+
       await performWithStateCheck(async () => {
-          await invoke('player_set_channels', { mode });
+          const finalMode = (trueSurround && mode > 2) ? mode + 100 : mode;
+          await invoke('player_set_channels', { mode: finalMode });
           if (currentTrack.value) await invoke('player_seek', { time: currentTime.value });
       });
   };
 
   const seekTo = async (percent: number) => {
+    if (isEngineSwitching.value || isDownloadingFFmpeg.value) return; 
+
     if (!currentTrack.value || currentTrack.value.duration <= 0) return;
     if (isTrackSwitching.value || isSeeking.value) return; 
 
@@ -480,13 +502,18 @@ export const usePlayerStore = defineStore('player', () => {
   };
   const stopProgressLoop = () => { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } };
 
-  watch(volume, (v) => { invoke('player_set_volume', { vol: v / 100.0 }); });
+  watch(volume, (v) => { 
+      if (!isEngineSwitching.value && !isDownloadingFFmpeg.value) {
+          invoke('player_set_volume', { vol: v / 100.0 }); 
+      }
+  });
 
   return { 
     isPlaying, isPaused, hasStarted, volume, progress, currentTime, playMode, queue, currentIndex, currentTrack, activeEngine, showPlaylist, 
     isDragging, isBuffering, isSeeking, 
     isDownloadingFFmpeg, ffmpegProgress, 
-    hasAudioInitialized, isSmtcEnabled, engineCoolingRemaining,
+    hasAudioInitialized, isSmtcEnabled, engineCoolingRemaining, isEngineSwitching, 
+    channelMode, isTrueSurround, // 🔥 新增暴露状态供 UI 绑定
     likedTracks, likedQueue, availableDevices, activeDevice, 
     togglePlay, nextTrack, prevTrack, seekTo, switchEngine, loadAndPlay, initCheck, setNotifier, importTracks, 
     togglePlaylist, toggleMode, toggleLike, isLiked, fetchDevices, setOutputDevice, playTrack, setChannelMode 
