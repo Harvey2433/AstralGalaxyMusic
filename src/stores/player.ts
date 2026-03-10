@@ -73,6 +73,9 @@ export const usePlayerStore = defineStore('player', () => {
   let actionTimeoutId: any = null;
   let coolingTimerId: any = null;
 
+  // 🔥 新增：音量记忆缓存
+  const lastActiveVolume = ref(Number(localStorage.getItem('last_active_vol') || '80'));
+
   // ==========================================
   // 队列与设备状态
   // ==========================================
@@ -645,6 +648,34 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   // ==========================================
+  // 🔥 带有状态锁和恢复逻辑的音量控制
+  // ==========================================
+  const setVolume = (v: number) => {
+      // 拦截死锁请求
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
+      volume.value = v;
+      // 只有在非静音滑动时才更新“最后活跃音量”
+      if (v > 0) {
+          lastActiveVolume.value = v;
+          localStorage.setItem('last_active_vol', v.toString());
+      }
+  };
+
+  const toggleMute = () => {
+      // 拦截死锁请求
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
+      if (volume.value > 0) {
+          // 正在发声，点击进入静音
+          lastActiveVolume.value = volume.value;
+          localStorage.setItem('last_active_vol', volume.value.toString());
+          volume.value = 0;
+      } else {
+          // 正在静音，点击恢复音量
+          volume.value = lastActiveVolume.value;
+      }
+  };
+
+  // ==========================================
   // 🔥 终极防爆音秒切逻辑
   // ==========================================
   const seekTo = async (percent: number) => {
@@ -896,6 +927,8 @@ export const usePlayerStore = defineStore('player', () => {
     setOutputDevice, 
     playTrack, 
     setChannelMode, 
-    toggleTrueSurround 
+    toggleTrueSurround, 
+    setVolume, 
+    toggleMute 
   };
 });

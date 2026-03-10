@@ -37,7 +37,7 @@ const creditsText = [
   "",
   "",
   "Powered by Rust & Vue",
-  "Made with ❤️ by Maple Bamboo"
+  "A project by Maple Bamboo Team"
 ];
 
 const meteors = ref<{ id: number, startX: number, startY: number, endX: number, endY: number, duration: number }[]>([]);

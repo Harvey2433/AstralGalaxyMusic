@@ -140,7 +140,7 @@ onMounted(() => {
 
       <section class="flex flex-col flex-1 relative z-20">
         <header class="h-16 flex items-center justify-between px-8 border-b border-white/5 bg-cosmos-900/20 cursor-move" data-tauri-drag-region>
-          <div class="text-xs font-mono tracking-[0.3em] text-starlight-cyan/50 pointer-events-none opacity-50 select-none">/// ASTRAL_CORE_V1</div>
+          <div class="text-xs font-mono tracking-[0.3em] text-starlight-cyan/50 pointer-events-none opacity-50 select-none">Astral Galaxy Music</div>
           <div class="flex gap-3">
             <button @click="minimize" class="w-3.5 h-3.5 rounded-full bg-yellow-500/20 border border-yellow-500/50 hover:bg-yellow-500 transition-all duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)] hover:scale-125 active:scale-90 flex items-center justify-center group no-drag-btn no-outline">
               <span class="opacity-0 group-hover:opacity-100 text-[8px] text-white">−</span>
