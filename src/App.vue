@@ -13,6 +13,8 @@ import PlaylistDrawer from './components/PlaylistDrawer.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import PlayerDashboard from './components/PlayerDashboard.vue';
 import PlayerControls from './components/PlayerControls.vue';
+import AboutPage from './components/AboutPage.vue'; 
+import CreditsPage from './components/CreditsPage.vue'; // 🔥 仅新增：引入贡献滚动页
 
 const player = usePlayerStore();
 const appWindow = getCurrentWindow();
@@ -57,13 +59,12 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
 // ==========================================
 // 🔥 Windows SMTC 状态实时同步 (终极懒加载分离版)
 // ==========================================
-let isSmtcActiveInBackend = false; // 记录后端 SMTC 钩子的真实状态
+let isSmtcActiveInBackend = false; 
 
 watch(
   () => [player.currentTrack, player.isPlaying, player.isSmtcEnabled, player.hasStarted], 
   async ([newTrack, isPlaying, isEnabled, hasStarted]) => {
     
-    // 拦截：如果开关没开，或者冷启动还没按过播放键，坚决不拉起底层服务
     if (!isEnabled || !hasStarted) {
         if (isSmtcActiveInBackend) {
             invoke('toggle_smtc_active', { enable: false }).catch(e => console.error(e));
@@ -72,13 +73,11 @@ watch(
         return;
     }
 
-    // 步骤 A：异步初始化 SMTC (仅当后端未激活时执行一次，避开启动卡顿)
     if (!isSmtcActiveInBackend) {
         await invoke('toggle_smtc_active', { enable: true }).catch(e => console.error(e));
         isSmtcActiveInBackend = true; 
     }
 
-    // 步骤 B：同步歌曲元数据
     if (newTrack && (newTrack as any).id) {
         invoke('sync_smtc_metadata', {
           title: (newTrack as any).title || 'Unknown',
@@ -87,21 +86,16 @@ watch(
         }).catch(e => console.error(e));
     }
 
-    // 步骤 C：同步播放状态
     invoke('sync_smtc_status', { isPlaying: !!isPlaying }).catch(e => console.error(e));
     
   }, 
-  { deep: true } // 🔥 去掉了 immediate: true，严格等待事件驱动
+  { deep: true } 
 );
 
-// ==========================================
-// 初始化生命周期 (修复启动卡死核心)
-// ==========================================
 // ==========================================
 // 🚀 初始化与系统环境封印 (修复窗口消失 Bug)
 // ==========================================
 onMounted(() => { 
-  // 1. 环境封印：禁用右键菜单、系统缩放
   document.oncontextmenu = (e) => { e.preventDefault(); return false; };
   document.addEventListener('keydown', (e) => { 
     if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '0'].includes(e.key)) e.preventDefault();
@@ -110,26 +104,20 @@ onMounted(() => {
       if (e.ctrlKey || e.metaKey) e.preventDefault();
   }, { passive: false });
 
-  // 2. 延迟 300ms 保证渲染安全
   setTimeout(() => {
     
-    // 🔥 终极修复 1：把显示窗口独立出来，并捕获任何可能的错误，绝不被阻塞！
     appWindow.show().then(() => {
-        // 安全地要一下焦点，如果失败也不影响显示
     }).catch(err => console.error("[TAURI] Failed to show window:", err));
 
-    // 🔥 终极修复 2：把异步监听器打包到独立的安全沙盒里执行
     Promise.all([
         listen('smtc-toggle', () => player.togglePlay()),
         listen('smtc-next', () => player.nextTrack()),
         listen('smtc-prev', () => player.prevTrack())
     ]).catch(e => console.error("[TAURI] Event listener bind failed:", e));
 
-    // 状态预热
     notify('Astral Galaxy Music Player'); 
     player.setNotifier(notify); 
     
-    // 启动非阻塞的 IO 库检查
     player.initCheck(); 
     player.fetchDevices();
     
@@ -190,6 +178,10 @@ onMounted(() => {
                     <div v-if="player.likedQueue.length === 0" class="text-white/30 text-center mt-20 font-orbitron tracking-widest">EMPTY_VAULT</div>
                  </div>
               </div>
+              
+              <div v-else-if="activeTab === 'about'" class="absolute inset-0 z-20 flex flex-col">
+                  <AboutPage />
+              </div>
           </Transition>
 
           <div v-show="activeTab === 'dashboard' || activeTab === 'settings'" 
@@ -206,6 +198,11 @@ onMounted(() => {
         <PlayerControls :showLyrics="showLyrics" @toggle-lyrics="showLyrics = !showLyrics" />
       </section>
     </div>
+
+    <Transition name="credits-fade">
+      <CreditsPage v-if="player.showCredits" @close="player.endCredits" />
+    </Transition>
+
   </main>
 </template>
 
@@ -264,4 +261,12 @@ button, input, select, [role="button"], .no-drag-btn { -webkit-app-region: no-dr
 
 /* 清除 Focus 轮廓线 */
 .no-outline:focus { outline: none; }
+
+/* 🔥 仅新增：贡献者界面的黑幕淡入淡出动画 */
+.credits-fade-enter-active, .credits-fade-leave-active { 
+  transition: opacity 1.5s ease-in-out; 
+}
+.credits-fade-enter-from, .credits-fade-leave-to { 
+  opacity: 0; 
+}
 </style>

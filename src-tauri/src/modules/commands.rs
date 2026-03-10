@@ -13,7 +13,13 @@ pub async fn get_lyrics(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn import_music(window: Window) -> Result<(), String> {
-    let files = FileDialog::new().add_filter("Audio", &["mp3", "flac", "wav", "ogg", "m4a", "wma", "aac"]).set_directory("/").pick_files();
+    // 🔥 加上 set_parent(&window) 使其成为原生级别的模态窗口，彻底冻结并阻塞主程序！
+    let files = FileDialog::new()
+        .add_filter("Audio", &["mp3", "flac", "wav", "ogg", "m4a", "wma", "aac"])
+        .set_directory("/")
+        .set_parent(&window)
+        .pick_files();
+        
     if let Some(paths) = files {
         let total = paths.len();
         let _ = window.emit("import-start", total);
@@ -24,6 +30,9 @@ pub async fn import_music(window: Window) -> Result<(), String> {
             });
             let _ = window.emit("import-finish", ());
         });
+    } else {
+        // 如果取消了选择，发送 cancel 解除前端的锁
+        let _ = window.emit("import-cancel", ());
     }
     Ok(())
 }

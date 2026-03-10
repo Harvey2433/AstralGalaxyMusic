@@ -15,13 +15,14 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
   notificationType.value = type; 
   isNotificationVisible.value = true;
   // 错误提示停留时间长一点，方便梦梦姐看清
-  setTimeout(() => { isNotificationVisible.value = false; }, type === 'error' ? 4000 : 2000);
+  notificationTimer = setTimeout(() => { isNotificationVisible.value = false; }, type === 'error' ? 4000 : 2000);
 };
 
 defineExpose({ notify });
 
 const currentIslandMode = computed(() => {
   if (isNotificationVisible.value) return 'notification';
+  if (player.isImporting) return 'importing'; 
   if (player.isBuffering || player.isSeeking) return 'loading'; 
   if (player.isPlaying && player.hasStarted && player.currentTrack) return 'media';
   if (player.isDownloadingFFmpeg) return 'downloading';
@@ -34,10 +35,10 @@ const islandWidth = computed(() => {
   if (currentIslandMode.value === 'media') return '260px';
   if (currentIslandMode.value === 'loading') return '110px';
   if (currentIslandMode.value === 'downloading') return '160px';
+  // 🔥 给 iOS 的 Leading/Trailing 布局流出足够的呼吸空间
+  if (currentIslandMode.value === 'importing') return '160px'; 
   if (currentIslandMode.value === 'notification') {
-    // 假设等宽字体每个字符大概占 8px，加上 padding 和 icon 的预留空间
     const textWidth = notificationText.value.length * 8;
-    // 保证最小宽度 220px，如果字太多就自适应拉长
     return Math.max(220, textWidth + 80) + 'px';
   }
   return '220px';
@@ -48,7 +49,7 @@ const islandHeight = computed(() => {
   if (currentIslandMode.value === 'idle') return '20px';
   if (currentIslandMode.value === 'media') return '40px';
   if (currentIslandMode.value === 'loading') return '32px';
-  return '36px'; // notification 和 downloading 状态
+  return '36px'; // notification, downloading, importing 状态共用
 });
 </script>
 
@@ -106,7 +107,7 @@ const islandHeight = computed(() => {
        :class="currentIslandMode === 'loading' ? 'opacity-100 scale-100 delay-100' : 'opacity-0 scale-95 pointer-events-none'"
      >
        <Loader2 :size="14" class="text-starlight-cyan animate-spin shrink-0" />
-       <span class="text-[9px] font-mono font-bold tracking-widest text-white">PROCESSING</span>
+       <span class="text-[9px] font-mono font-bold tracking-widest text-white">Processing</span>
      </div>
 
      <div 
@@ -114,7 +115,34 @@ const islandHeight = computed(() => {
        :class="currentIslandMode === 'downloading' ? 'opacity-100 scale-100 delay-100' : 'opacity-0 scale-95 pointer-events-none'"
      >
        <DownloadCloud :size="16" class="text-yellow-400 animate-pulse shrink-0" />
-       <span class="text-[10px] font-mono font-bold tracking-widest text-yellow-400 truncate min-w-0">Downloading</span>
+       <span class="text-[10px] font-mono font-bold tracking-widest text-yellow-400 truncate min-w-0">Downloading...</span>
+     </div>
+
+     <div 
+       class="absolute inset-0 flex items-center justify-between px-3.5 transition-all duration-500 ease-out"
+       :class="currentIslandMode === 'importing' ? 'opacity-100 scale-100 delay-100' : 'opacity-0 scale-95 pointer-events-none'"
+     >
+       <div class="flex items-center gap-2 min-w-0">
+           <div class="relative flex items-center justify-center shrink-0 w-[16px] h-[16px]">
+              <svg class="w-full h-full -rotate-90" viewBox="0 0 24 24">
+                <circle class="text-white/15" stroke-width="4" stroke="currentColor" fill="transparent" r="10" cx="12" cy="12" />
+                <circle class="text-starlight-cyan transition-all duration-300 ease-out" 
+                        style="filter: drop-shadow(0 0 2px rgba(100,255,218,0.5));" 
+                        stroke-width="4" 
+                        stroke-dasharray="62.83" 
+                        :stroke-dashoffset="62.83 - (player.importProgress / 100) * 62.83" 
+                        stroke-linecap="round" 
+                        stroke="currentColor" 
+                        fill="transparent" 
+                        r="10" cx="12" cy="12" />
+              </svg>
+           </div>
+           <span class="text-[11px] font-semibold text-white tracking-wide truncate mt-[1px]">Importing</span>
+       </div>
+       
+       <div class="flex shrink-0 pl-2">
+           <span class="text-[10px] font-mono font-medium text-starlight-cyan/80 tracking-tighter mt-[1px]">{{ player.importCount }} / {{ player.importTotal }}</span>
+       </div>
      </div>
 
      <div 

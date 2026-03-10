@@ -23,50 +23,49 @@ const engines = [
 
 const selectEngine = async (id: string) => {
   if (engineState.value === 'switching' || player.activeEngine === id) return;
-  if (id === 'ffmpeg' && player.isDownloadingFFmpeg) { emit('notify', 'FFMPEG IS CURRENTLY DOWNLOADING', 'error'); return; }
+  if (id === 'ffmpeg' && player.isDownloadingFFmpeg) { emit('notify', 'FFmpeg is currently downloading', 'error'); return; }
   
   if (player.engineCoolingRemaining > 0) {
       targetEngineId.value = id;
       engineState.value = 'failed';
-      emit('notify', `SYSTEM COOLING: ${player.engineCoolingRemaining}S`, 'cooling');
+      emit('notify', `System cooling: ${player.engineCoolingRemaining}s`, 'cooling');
       setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000);
       return;
   }
 
-  targetEngineId.value = id; engineState.value = 'switching'; emit('notify', `INITIALIZING ${id.toUpperCase()}...`);
+  targetEngineId.value = id; engineState.value = 'switching'; emit('notify', `Initializing ${id}...`);
   const result = await player.switchEngine(id);
-  if (result === 'SUCCESS') { engineState.value = 'success'; emit('notify', `${id.toUpperCase()} ENGINE READY`); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500); } 
+  if (result === 'SUCCESS') { engineState.value = 'success'; emit('notify', `${id.charAt(0).toUpperCase() + id.slice(1)} engine ready`); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 1500); } 
   else if (result === 'DOWNLOADING') { engineState.value = 'idle'; targetEngineId.value = ''; } 
   else if (result === 'COOLING') { engineState.value = 'failed'; setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
-  else { engineState.value = 'failed'; emit('notify', `FAILED TO LOAD ${id.toUpperCase()}`, 'error'); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
+  else { engineState.value = 'failed'; emit('notify', `Failed to load ${id}`, 'error'); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
 };
 
 const setChannel = async (ch: number) => { 
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
-        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        emit('notify', 'System busy: Engine locked', 'error');
         return;
     }
 
     const res = await player.setChannelMode(ch); 
     if (res === 'SUCCESS') {
-        emit('notify', `AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`); 
+        emit('notify', `Audio output: ${ch === 2 ? 'Stereo' : ch.toFixed(1) + ' Surround'}`); 
     }
-    // THROTTLED 会被静默无视
 };
 
 const selectOutputDevice = async (e: Event) => { 
     const target = e.target as HTMLSelectElement;
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
         target.value = player.activeDevice;
-        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        emit('notify', 'System busy: Engine locked', 'error');
         return;
     }
 
     const res = await player.setOutputDevice(target.value); 
     if (res === 'THROTTLED' || res === 'FAILED') {
-        target.value = player.activeDevice; // 拦截并把下拉框选项强行弹回去，无通知
+        target.value = player.activeDevice; 
     } else if (res === 'SUCCESS') {
-        emit('notify', `OUTPUT: ${target.value}`);
+        emit('notify', `Output: ${target.value}`);
     }
 };
 
@@ -74,21 +73,20 @@ const toggleTrueSurround = async () => {
     if (player.channelMode === 2) return; 
     
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
-        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        emit('notify', 'System busy: Engine locked', 'error');
         return;
     }
 
     const res = await player.toggleTrueSurround();
     if (res === 'SUCCESS') {
-        emit('notify', player.isTrueSurround ? 'TRUE SURROUND ENABLED' : 'VIRTUAL SURROUND ENABLED');
+        emit('notify', player.isTrueSurround ? 'True surround enabled' : 'Virtual surround enabled');
     }
-    // THROTTLED 会被静默无视
 };
 
 const toggleSMTC = () => {
     player.isSmtcEnabled = !player.isSmtcEnabled;
     localStorage.setItem('smtc_enabled', JSON.stringify(player.isSmtcEnabled));
-    emit('notify', player.isSmtcEnabled ? 'NATIVE SMTC ENABLED' : 'NATIVE SMTC DISABLED');
+    emit('notify', player.isSmtcEnabled ? 'Native SMTC enabled' : 'Native SMTC disabled');
 };
 </script>
 

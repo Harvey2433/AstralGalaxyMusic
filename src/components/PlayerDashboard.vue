@@ -51,7 +51,6 @@ const loadLyrics = async () => {
   } catch (e) { console.error(e); }
 };
 
-// 🔥 组件挂载时自动检查是否有歌词要加载
 onMounted(() => {
   if (player.currentTrack) {
     loadLyrics();
@@ -105,8 +104,8 @@ watch(() => props.showLyrics, (newVal) => {
             <Radio :size="24" class="text-starlight-cyan/50 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"/>
         </div>
         <div class="text-center space-y-2">
-          <h1 class="text-3xl font-bold font-orbitron tracking-wider text-white drop-shadow-lg">No Track Selected</h1>
-          <p class="text-sm text-cosmos-300 font-mono tracking-[0.3em] uppercase opacity-70">IDLE</p>
+          <h1 class="text-3xl font-bold font-orbitron tracking-wider text-white drop-shadow-lg">No track selected</h1>
+          <p class="text-sm text-cosmos-300 font-mono tracking-[0.3em] opacity-70">Idle</p>
         </div>
     </div>
 
@@ -133,7 +132,7 @@ watch(() => props.showLyrics, (newVal) => {
       <Transition name="slide-up">
           <div v-if="showLyrics" class="absolute inset-0 z-30 bg-black/60 backdrop-blur-xl mask-gradient flex flex-col items-center justify-center">
                <div v-if="lyricsLines.length === 0" class="text-white/20 font-orbitron tracking-widest text-sm animate-pulse">
-                  NO LYRICS FOUND
+                  No lyrics found
                </div>
                <div v-else class="w-full h-full relative overflow-hidden"> 
                    <div ref="lyricsWrapperRef" class="absolute left-0 w-full flex flex-col items-center gap-6 transition-transform duration-700 cubic-bezier(0.25, 0.46, 0.45, 0.94)" :style="{ transform: `translateY(${scrollOffset}px)`, top: '50%' }">
