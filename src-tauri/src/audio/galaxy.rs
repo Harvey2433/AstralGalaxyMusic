@@ -352,19 +352,6 @@ impl AudioEngine for GalaxyEngine {
             sink_guard.pause(); 
         }
 
-        let start_wait = Instant::now();
-        while !self.is_decoded.load(Ordering::Acquire) {
-            if self.seek_session.load(Ordering::SeqCst) != my_seek_session {
-                return; 
-            }
-            if start_wait.elapsed().as_secs() > 45 { 
-                debug_log!("Decode wait timed out.");
-                break;
-            }
-            thread::sleep(Duration::from_millis(20)); 
-        }
-
-        if self.seek_session.load(Ordering::SeqCst) != my_seek_session { return; }
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
         

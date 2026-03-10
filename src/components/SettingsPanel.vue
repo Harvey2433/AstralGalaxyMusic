@@ -41,18 +41,48 @@ const selectEngine = async (id: string) => {
   else { engineState.value = 'failed'; emit('notify', `FAILED TO LOAD ${id.toUpperCase()}`, 'error'); setTimeout(() => { engineState.value = 'idle'; targetEngineId.value = ''; }, 2000); }
 };
 
-const setChannel = (ch: number) => { 
-    player.setChannelMode(ch, player.isTrueSurround); 
-    emit('notify', `AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`); 
+const setChannel = async (ch: number) => { 
+    if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
+        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        return;
+    }
+
+    const res = await player.setChannelMode(ch); 
+    if (res === 'SUCCESS') {
+        emit('notify', `AUDIO OUTPUT: ${ch === 2 ? 'STEREO' : ch.toFixed(1) + ' SURROUND'}`); 
+    }
+    // THROTTLED 会被静默无视
 };
 
-const selectOutputDevice = (e: Event) => { player.setOutputDevice((e.target as HTMLSelectElement).value); };
+const selectOutputDevice = async (e: Event) => { 
+    const target = e.target as HTMLSelectElement;
+    if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
+        target.value = player.activeDevice;
+        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        return;
+    }
 
-const toggleTrueSurround = () => {
+    const res = await player.setOutputDevice(target.value); 
+    if (res === 'THROTTLED' || res === 'FAILED') {
+        target.value = player.activeDevice; // 拦截并把下拉框选项强行弹回去，无通知
+    } else if (res === 'SUCCESS') {
+        emit('notify', `OUTPUT: ${target.value}`);
+    }
+};
+
+const toggleTrueSurround = async () => {
     if (player.channelMode === 2) return; 
-    const newVal = !player.isTrueSurround;
-    player.setChannelMode(player.channelMode, newVal);
-    emit('notify', newVal ? 'TRUE SURROUND ENABLED' : 'VIRTUAL SURROUND ENABLED');
+    
+    if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
+        emit('notify', 'SYSTEM BUSY: ENGINE LOCK', 'error');
+        return;
+    }
+
+    const res = await player.toggleTrueSurround();
+    if (res === 'SUCCESS') {
+        emit('notify', player.isTrueSurround ? 'TRUE SURROUND ENABLED' : 'VIRTUAL SURROUND ENABLED');
+    }
+    // THROTTLED 会被静默无视
 };
 
 const toggleSMTC = () => {

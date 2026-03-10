@@ -34,10 +34,14 @@ export const usePlayerStore = defineStore('player', () => {
   const isSmtcEnabled = ref(JSON.parse(localStorage.getItem('smtc_enabled') || 'true'));
   const isEngineSwitching = ref(false);
   const hasAudioInitialized = ref(false);
+  
+  // 引擎专属冷却
   const lastEngineSwitchTime = ref(0);
   const engineCoolingRemaining = ref(0);
 
-  // 🔥 新增：从本地存储读取声道设置并保持响应式
+  // 极简无锁机制：只保留一个 1 秒硬拦截时间戳
+  const lastMixerActionTime = ref(0);
+
   const channelMode = ref(Number(localStorage.getItem('channel_mode') || '2'));
   const isTrueSurround = ref(JSON.parse(localStorage.getItem('true_surround') || 'false'));
 
@@ -66,7 +70,7 @@ export const usePlayerStore = defineStore('player', () => {
       } catch (e) { console.error("Sync Engine Failed:", e); }
   };
 
-  const startCoolingTimer = () => {
+  const startEngineCoolingTimer = () => {
       if (coolingTimerId) clearInterval(coolingTimerId); 
       lastEngineSwitchTime.value = Date.now(); 
       engineCoolingRemaining.value = 30;
@@ -125,7 +129,7 @@ export const usePlayerStore = defineStore('player', () => {
                               await invoke('player_pause');
                           }
                       }
-                      startCoolingTimer();
+                      startEngineCoolingTimer();
                   }
               } catch (err) {
                   notifyUI.value?.('FFMPEG FAILED', 'error');
@@ -135,7 +139,7 @@ export const usePlayerStore = defineStore('player', () => {
           } else if (status === 'cooling') {
               isDownloadingFFmpeg.value = false;
               isEngineSwitching.value = false;
-              startCoolingTimer();
+              startEngineCoolingTimer();
               notifyUI.value?.('SYS COOLING...', 'cooling');
           } else if (status === 'error') {
               isDownloadingFFmpeg.value = false;
@@ -204,7 +208,7 @@ export const usePlayerStore = defineStore('player', () => {
               }
               
               isEngineSwitching.value = false;
-              startCoolingTimer(); 
+              startEngineCoolingTimer(); 
               return 'SUCCESS';
           }
           throw new Error("Invalid response");
@@ -379,39 +383,81 @@ export const usePlayerStore = defineStore('player', () => {
   };
   const toggleMode = () => { const modes: PlayMode[] = ['sequence', 'loop', 'shuffle']; playMode.value = modes[(modes.indexOf(playMode.value) + 1) % modes.length]; };
 
-  const performWithStateCheck = async (action: () => Promise<void>) => {
-      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return; 
+  // 设备切换 (特权豁免，不拦截重复状态)
+  const setOutputDevice = async (device: string): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return 'FAILED';
+      
+      if (Date.now() - lastMixerActionTime.value < 1000) return 'THROTTLED';
+      lastMixerActionTime.value = Date.now();
 
-      const wasPaused = isPaused.value || !isPlaying.value;
-      await action();
-      if (wasPaused) { await invoke('player_pause'); } 
-      else { await invoke('player_set_volume', { vol: Math.max(0.01, volume.value / 100.0) }); }
+      try {
+          await invoke('set_output_device', { device });
+          activeDevice.value = device;
+          hasAudioInitialized.value = true;
+          
+          if (currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
+              await invoke('player_seek', { time: currentTime.value });
+          }
+      } catch (e) { 
+          notifyUI.value?.('DEVICE ERROR', 'error'); 
+          return 'FAILED'; 
+      }
+
+      return 'SUCCESS';
   };
 
-  const setOutputDevice = async (device: string) => {
-    await performWithStateCheck(async () => {
-        try {
-            await invoke('set_output_device', { device });
-            activeDevice.value = device;
-            hasAudioInitialized.value = true;
-            notifyUI.value?.(`OUTPUT: ${device}`);
-            if (currentTrack.value) await invoke('player_seek', { time: currentTime.value });
-        } catch (e) { notifyUI.value?.('DEVICE ERROR', 'error'); }
-    });
-  };
+  // 🔥 终极无锁切换策略：声道切换 (增加防重复切换机制)
+  const setChannelMode = async (mode: number): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return 'FAILED';
+      
+      if (mode === 2) {
+          isTrueSurround.value = false; // 特权：无视时间戳，强制清空
+      } else {
+          if (Date.now() - lastMixerActionTime.value < 1000) return 'THROTTLED';
+      }
+      
+      // 照样吃掉一次冷却时间
+      lastMixerActionTime.value = Date.now();
 
-  // 🔥 修复：将状态保存到 Pinia 和 localStorage，实现永久记忆
-  const setChannelMode = async (mode: number, trueSurround: boolean = false) => {
+      // 🔥 核心改动：如果是重复切换到当前状态，直接拦截，算作一次无意义的成功操作
+      if (channelMode.value === mode) {
+          return 'SUCCESS';
+      }
+
       channelMode.value = mode;
-      isTrueSurround.value = trueSurround;
       localStorage.setItem('channel_mode', mode.toString());
-      localStorage.setItem('true_surround', JSON.stringify(trueSurround));
+      localStorage.setItem('true_surround', JSON.stringify(isTrueSurround.value));
 
-      await performWithStateCheck(async () => {
-          const finalMode = (trueSurround && mode > 2) ? mode + 100 : mode;
-          await invoke('player_set_channels', { mode: finalMode });
-          if (currentTrack.value) await invoke('player_seek', { time: currentTime.value });
-      });
+      const finalMode = (isTrueSurround.value && mode > 2) ? mode + 100 : mode;
+      await invoke('player_set_channels', { mode: finalMode });
+      
+      // 切歌竞态保护：更新完配置后，放弃触发 seek，把脏活交给 load
+      if (currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
+          await invoke('player_seek', { time: currentTime.value });
+      }
+
+      return 'SUCCESS';
+  };
+
+  // 真环绕切换 (特权豁免，不拦截重复状态，因为它是 toggle)
+  const toggleTrueSurround = async (): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
+      if (channelMode.value === 2) return 'FAILED';
+      if (isEngineSwitching.value || isDownloadingFFmpeg.value) return 'FAILED';
+      
+      if (Date.now() - lastMixerActionTime.value < 1000) return 'THROTTLED';
+      lastMixerActionTime.value = Date.now();
+
+      isTrueSurround.value = !isTrueSurround.value;
+      localStorage.setItem('true_surround', JSON.stringify(isTrueSurround.value));
+
+      const finalMode = (isTrueSurround.value && channelMode.value > 2) ? channelMode.value + 100 : channelMode.value;
+      await invoke('player_set_channels', { mode: finalMode });
+      
+      if (currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
+          await invoke('player_seek', { time: currentTime.value });
+      }
+
+      return 'SUCCESS';
   };
 
   const seekTo = async (percent: number) => {
@@ -513,9 +559,9 @@ export const usePlayerStore = defineStore('player', () => {
     isDragging, isBuffering, isSeeking, 
     isDownloadingFFmpeg, ffmpegProgress, 
     hasAudioInitialized, isSmtcEnabled, engineCoolingRemaining, isEngineSwitching, 
-    channelMode, isTrueSurround, // 🔥 新增暴露状态供 UI 绑定
+    channelMode, isTrueSurround, 
     likedTracks, likedQueue, availableDevices, activeDevice, 
     togglePlay, nextTrack, prevTrack, seekTo, switchEngine, loadAndPlay, initCheck, setNotifier, importTracks, 
-    togglePlaylist, toggleMode, toggleLike, isLiked, fetchDevices, setOutputDevice, playTrack, setChannelMode 
+    togglePlaylist, toggleMode, toggleLike, isLiked, fetchDevices, setOutputDevice, playTrack, setChannelMode, toggleTrueSurround 
   };
 });

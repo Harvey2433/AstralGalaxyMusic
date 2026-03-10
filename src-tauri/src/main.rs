@@ -14,8 +14,9 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use base64::{Engine as _, engine::general_purpose};
 
 // 全局句柄，记录 HWND 以便原生同步 
+// 🔥 改造：将 controls 套上 Option，实现真正的懒加载
 struct SmtcHandle {
-    controls: Mutex<MediaControls>,
+    controls: Mutex<Option<MediaControls>>,
     hwnd_ptr: isize,
 }
 
@@ -115,13 +116,46 @@ async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) 
     Ok(())
 }
 
+// 🔥 改造：注入 tauri::AppHandle，实现首次触发时懒加载初始化
 #[tauri::command]
-async fn sync_smtc_metadata(handle: tauri::State<'_, SmtcHandle>, title: String, artist: String, cover: String) -> Result<(), String> {
+async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, SmtcHandle>, title: String, artist: String, cover: String) -> Result<(), String> {
     log_smtc("---------- SMTC Metadata Sync ----------");
     
+    // A. 懒加载初始化 SMTC Controls (防竞态锁)
+    {
+        let mut controls_guard = handle.controls.lock().unwrap();
+        if controls_guard.is_none() {
+            log_smtc("[NATIVE] First track played. Lazy initializing SMTC controls...");
+            let config = PlatformConfig { 
+                dbus_name: "AstralGalaxy", 
+                display_name: "Astral Galaxy Music", 
+                hwnd: Some(handle.hwnd_ptr as *mut std::ffi::c_void) 
+            };
+            
+            if let Ok(mut new_controls) = MediaControls::new(config) {
+                let app_clone = app.clone();
+                new_controls.attach(move |event| {
+                    match event {
+                        MediaControlEvent::Play | MediaControlEvent::Pause | MediaControlEvent::Toggle => { 
+                            let _ = app_clone.emit("smtc-toggle", ()); 
+                        },
+                        MediaControlEvent::Next => { let _ = app_clone.emit("smtc-next", ()); },
+                        MediaControlEvent::Previous => { let _ = app_clone.emit("smtc-prev", ()); },
+                        _ => {}
+                    }
+                }).unwrap();
+                
+                *controls_guard = Some(new_controls);
+                log_smtc("[NATIVE] SMTC initialized and hooked successfully.");
+            } else {
+                log_smtc("[ERROR] Failed to initialize SMTC controls.");
+            }
+        }
+    }
+
     let mut extracted_path: Option<String> = None;
 
-    // A. 处理封面落盘逻辑 
+    // B. 处理封面落盘逻辑 
     if !cover.is_empty() && !cover.contains("DEFAULT_COVER") {
         if cover.starts_with("data:image/") {
             if let Some(base64_data) = cover.split(',').nth(1) {
@@ -146,7 +180,7 @@ async fn sync_smtc_metadata(handle: tauri::State<'_, SmtcHandle>, title: String,
         }
     }
 
-    // B. 全量走原生调用，完全接管封面显示 
+    // C. 全量走原生调用，完全接管封面显示 
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = sync_to_windows_smtc_native(handle.hwnd_ptr, &title, &artist, extracted_path) {
@@ -161,14 +195,16 @@ async fn sync_smtc_metadata(handle: tauri::State<'_, SmtcHandle>, title: String,
 
 #[tauri::command]
 async fn sync_smtc_status(handle: tauri::State<'_, SmtcHandle>, is_playing: bool) -> Result<(), String> {
-    // 播放状态还是可以用 souvlaki 的，因为它不涉及 DisplayUpdater 
-    let mut controls = handle.controls.lock().unwrap();
-    let playback = if is_playing { 
-        MediaPlayback::Playing { progress: None } 
-    } else { 
-        MediaPlayback::Paused { progress: None } 
-    };
-    let _ = controls.set_playback(playback);
+    // 🔥 改造：只有在 controls 被初始化后才会同步状态
+    let mut controls_guard = handle.controls.lock().unwrap();
+    if let Some(controls) = controls_guard.as_mut() {
+        let playback = if is_playing { 
+            MediaPlayback::Playing { progress: None } 
+        } else { 
+            MediaPlayback::Paused { progress: None } 
+        };
+        let _ = controls.set_playback(playback);
+    }
     Ok(())
 }
 
@@ -189,27 +225,9 @@ fn main() {
                 _ => 0,
             };
 
-            // 配置 souvlaki (仅用于事件处理) 
-            let config = PlatformConfig { 
-                dbus_name: "AstralGalaxy", 
-                display_name: "Astral Galaxy Music", 
-                hwnd: Some(hwnd_ptr as *mut std::ffi::c_void) 
-            };
-            let mut controls = MediaControls::new(config).expect("Failed to create media controls");
-
-            let app_handle = app.handle().clone();
-            controls.attach(move |event| {
-                match event {
-                    MediaControlEvent::Play | MediaControlEvent::Pause | MediaControlEvent::Toggle => { 
-                        let _ = app_handle.emit("smtc-toggle", ()); 
-                    },
-                    MediaControlEvent::Next => { let _ = app_handle.emit("smtc-next", ()); },
-                    MediaControlEvent::Previous => { let _ = app_handle.emit("smtc-prev", ()); },
-                    _ => {}
-                }
-            }).unwrap();
-
-            app.manage(SmtcHandle { controls: Mutex::new(controls), hwnd_ptr });
+            // 🔥 改造：在应用启动的 setup 阶段什么都不做，只保存空壳和窗口句柄
+            // 剥离了之前抢跑执行的 MediaControls::new
+            app.manage(SmtcHandle { controls: Mutex::new(None), hwnd_ptr });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -218,7 +236,7 @@ fn main() {
             player_set_channels, get_output_devices, set_output_device,
             get_lyrics, get_current_engine,
             sync_smtc_metadata, sync_smtc_status,
-            toggle_smtc_active // 🔥 新指令已注册
+            toggle_smtc_active
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
