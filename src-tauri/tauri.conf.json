@@ -20,7 +20,8 @@
         "transparent": true,
         "resizable": true,
         "minWidth": 900,
-        "minHeight": 600
+        "minHeight": 600,
+        "visible": false
       }
     ]
   },
@@ -42,6 +43,9 @@
         "sidebarImage": "icons/installer_side.bmp",
         "headerImage": "icons/installer_header.bmp",
         "displayLanguageSelector": true
+      },
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
       }
     }
   }

@@ -8,27 +8,21 @@ use audio::AudioManager;
 use modules::state::AppState;
 use modules::commands::*; 
 
-use tauri::{Manager, Emitter, Runtime}; 
+use tauri::{Manager, Emitter, Listener, Runtime}; 
 use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use base64::{Engine as _, engine::general_purpose};
 
-// 全局句柄，记录 HWND 以便原生同步 
-// 🔥 改造：将 controls 套上 Option，实现真正的懒加载
 struct SmtcHandle {
     controls: Mutex<Option<MediaControls>>,
     hwnd_ptr: isize,
 }
 
-// 统一日志输出 
 fn log_smtc(msg: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     println!("[{}] {}", timestamp, msg);
 }
 
-// ============================================================
-// 🔥 核心原生同步函数：解决封面不显示的一切罪魁祸首
-// ============================================================
 #[cfg(target_os = "windows")]
 fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image_path: Option<String>) -> windows::core::Result<()> {
     use windows::Win32::Foundation::HWND;
@@ -41,30 +35,23 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
 
     let hwnd = HWND(hwnd_ptr as *mut core::ffi::c_void);
     
-    // 1. 通过 Interop 接口获取该窗口对应的 SMTC 实例 
     let interop: ISystemMediaTransportControlsInterop = windows::core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>()?;
     let smtc: SystemMediaTransportControls = unsafe { interop.GetForWindow(hwnd) }?;
     
-    // 🔥 保证如果之前被禁用了，这次更新能把它强制叫醒
     smtc.SetIsEnabled(true)?;
 
-    // 2. 获取 DisplayUpdater 并【必须】设置类型为 Music
     let updater = smtc.DisplayUpdater()?;
     updater.SetType(MediaPlaybackType::Music)?; 
 
-    // 3. 设置文字信息 
     let music_props = updater.MusicProperties()?;
     music_props.SetTitle(&HSTRING::from(title))?;
     music_props.SetArtist(&HSTRING::from(artist))?;
 
-    // 4. 处理封面图片（解决物理路径与中文编码） 
     if let Some(raw_path) = image_path {
         if let Ok(path) = Path::new(&raw_path).canonicalize() {
-            // 去掉 Windows 的 UNC 前缀 \\?\ 提高兼容性 
             let path_str = path.to_str().unwrap_or_default().replace("\\\\?\\", "");
             let h_path = HSTRING::from(&path_str);
             
-            // 使用同步阻塞获取文件 (get() 是关键) 
             if let Ok(file) = StorageFile::GetFileFromPathAsync(&h_path)?.get() {
                 let stream_ref = RandomAccessStreamReference::CreateFromFile(&file)?;
                 updater.SetThumbnail(&stream_ref)?;
@@ -73,14 +60,10 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
         }
     }
 
-    // 5. 提交更新到系统面板 
     updater.Update()?;
     Ok(())
 }
 
-// ============================================================
-// 🔥 新增：彻底控制 SMTC 消失/显示的核心指令
-// ============================================================
 #[tauri::command]
 async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
@@ -92,16 +75,10 @@ async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) 
 
         let hwnd = HWND(handle.hwnd_ptr as *mut core::ffi::c_void);
         if let Ok(interop) = windows::core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>() {
-            
-            // 🔥 修复 E0282 报错：明确指定 `smtc` 为 `SystemMediaTransportControls` 类型
             let smtc_result: windows::core::Result<SystemMediaTransportControls> = unsafe { interop.GetForWindow(hwnd) };
-            
             if let Ok(smtc) = smtc_result {
-                // 强制切断或恢复钩子
                 let _ = smtc.SetIsEnabled(enable);
-                
                 if !enable {
-                    // 如果是禁用，顺手清理一下里面的缓存残留
                     if let Ok(updater) = smtc.DisplayUpdater() {
                         let _ = updater.ClearAll();
                         let _ = updater.Update();
@@ -116,12 +93,10 @@ async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) 
     Ok(())
 }
 
-// 🔥 改造：注入 tauri::AppHandle，实现首次触发时懒加载初始化
 #[tauri::command]
 async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, SmtcHandle>, title: String, artist: String, cover: String) -> Result<(), String> {
     log_smtc("---------- SMTC Metadata Sync ----------");
     
-    // A. 懒加载初始化 SMTC Controls (防竞态锁)
     {
         let mut controls_guard = handle.controls.lock().unwrap();
         if controls_guard.is_none() {
@@ -155,13 +130,11 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
 
     let mut extracted_path: Option<String> = None;
 
-    // B. 处理封面落盘逻辑 
     if !cover.is_empty() && !cover.contains("DEFAULT_COVER") {
         if cover.starts_with("data:image/") {
             if let Some(base64_data) = cover.split(',').nth(1) {
                 if let Ok(image_bytes) = general_purpose::STANDARD.decode(base64_data.trim()) {
                     let temp_dir = std::env::temp_dir();
-                    // 加毫秒级时间戳防缓存 
                     let timestamp = chrono::Local::now().timestamp_micros();
                     let temp_path = temp_dir.join(format!("astral_cover_{}.jpg", timestamp));
                     
@@ -171,7 +144,6 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
                 }
             }
         } else {
-            // 处理路径格式化 
             let clean = cover.replace("asset://localhost/", "").replace("file:///", "").replace("file://", "");
             let decoded = urlencoding::decode(&clean).unwrap_or(std::borrow::Cow::Borrowed(&clean)).to_string();
             let mut p = decoded.replace("/", "\\");
@@ -180,7 +152,6 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
         }
     }
 
-    // C. 全量走原生调用，完全接管封面显示 
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = sync_to_windows_smtc_native(handle.hwnd_ptr, &title, &artist, extracted_path) {
@@ -195,7 +166,6 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
 
 #[tauri::command]
 async fn sync_smtc_status(handle: tauri::State<'_, SmtcHandle>, is_playing: bool) -> Result<(), String> {
-    // 🔥 改造：只有在 controls 被初始化后才会同步状态
     let mut controls_guard = handle.controls.lock().unwrap();
     if let Some(controls) = controls_guard.as_mut() {
         let playback = if is_playing { 
@@ -213,20 +183,58 @@ fn main() {
     
     let audio_manager = Arc::new(Mutex::new(AudioManager::new()));
     
+    // 🔥 硬件哨兵线程克隆引用
+    let am_monitor = audio_manager.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState { audio_manager })
-        .setup(|app| {
+        .setup(move |app| {
             let main_window = app.get_webview_window("main").unwrap();
+            let app_handle = app.handle().clone();
             
             let hwnd_ptr = match main_window.window_handle().unwrap().as_raw() {
                 RawWindowHandle::Win32(h) => h.hwnd.get() as isize,
                 _ => 0,
             };
 
-            // 🔥 改造：在应用启动的 setup 阶段什么都不做，只保存空壳和窗口句柄
-            // 剥离了之前抢跑执行的 MediaControls::new
+            let window_clone = main_window.clone();
+            main_window.listen("webview-ready", move |_| {
+                let _ = window_clone.show();
+                let _ = window_clone.set_focus();
+                println!("[NATIVE] Window securely shown and focused.");
+            });
+
+            // 🔥 独立后台哨兵：绝对不阻塞前端，由前端主导暂停与恢复
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    
+                    let target_device = {
+                        let mut am = am_monitor.lock().unwrap();
+                        am.check_device_status()
+                    };
+                    
+                    if let Some(device) = target_device {
+                        println!("[AUDIO] Hardware Topology Changed! Syncing to frontend for Safe Migration to: {}", device);
+                        
+                        // 1. 同步前端，强制 UI 暂停（解除锁，防止死锁）
+                        let _ = app_handle.emit("force-pause", ());
+                        std::thread::sleep(std::time::Duration::from_millis(250)); 
+                        
+                        // 2. 重新获取锁，执行底层切换并无缝重建缓冲队列
+                        {
+                            let mut am = am_monitor.lock().unwrap();
+                            let _ = am.set_audio_device(&device);
+                        }
+                        
+                        // 3. 同步前端，恢复播放
+                        let _ = app_handle.emit("force-play", ());
+                    }
+                }
+            });
+
             app.manage(SmtcHandle { controls: Mutex::new(None), hwnd_ptr });
             Ok(())
         })

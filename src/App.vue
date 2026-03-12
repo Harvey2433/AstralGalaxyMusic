@@ -2,7 +2,7 @@
 import { ref, onMounted, watch } from 'vue';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event'; 
+import { listen, emit } from '@tauri-apps/api/event'; 
 import { usePlayerStore } from './stores/player'; 
 import { Play, Heart } from 'lucide-vue-next';
 
@@ -14,7 +14,7 @@ import SettingsPanel from './components/SettingsPanel.vue';
 import PlayerDashboard from './components/PlayerDashboard.vue';
 import PlayerControls from './components/PlayerControls.vue';
 import AboutPage from './components/AboutPage.vue'; 
-import CreditsPage from './components/CreditsPage.vue'; // 🔥 仅新增：引入贡献滚动页
+import CreditsPage from './components/CreditsPage.vue'; 
 
 const player = usePlayerStore();
 const appWindow = getCurrentWindow();
@@ -106,13 +106,18 @@ onMounted(() => {
 
   setTimeout(() => {
     
-    appWindow.show().then(() => {
-    }).catch(err => console.error("[TAURI] Failed to show window:", err));
+    // 🔥 妹妹的赎罪：把丢失的 emit('webview-ready') 完整补回来了！必须用这个通知后端！
+    emit('webview-ready').then(() => {
+      console.log("[TAURI] Ready signal sent to backend.");
+    }).catch(err => console.error("[TAURI] Failed to send ready signal:", err));
 
     Promise.all([
         listen('smtc-toggle', () => player.togglePlay()),
         listen('smtc-next', () => player.nextTrack()),
-        listen('smtc-prev', () => player.prevTrack())
+        listen('smtc-prev', () => player.prevTrack()),
+        // 🔥 时空哨兵指令：接收后端时停恢复指令，全自动同步 UI
+        listen('force-pause', () => { if (player.isPlaying) player.togglePlay(); }),
+        listen('force-play', () => { if (!player.isPlaying) player.togglePlay(); })
     ]).catch(e => console.error("[TAURI] Event listener bind failed:", e));
 
     notify('Astral Galaxy Music Player'); 
@@ -140,7 +145,7 @@ onMounted(() => {
 
       <section class="flex flex-col flex-1 relative z-20">
         <header class="h-16 flex items-center justify-between px-8 border-b border-white/5 bg-cosmos-900/20 cursor-move" data-tauri-drag-region>
-          <div class="text-xs font-mono tracking-[0.3em] text-starlight-cyan/50 pointer-events-none opacity-50 select-none">Astral Galaxy Music</div>
+          <div class="text-xs font-mono tracking-[0.3em] text-starlight-cyan/50 pointer-events-none opacity-50 select-none">/// ASTRAL_CORE_V1</div>
           <div class="flex gap-3">
             <button @click="minimize" class="w-3.5 h-3.5 rounded-full bg-yellow-500/20 border border-yellow-500/50 hover:bg-yellow-500 transition-all duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)] hover:scale-125 active:scale-90 flex items-center justify-center group no-drag-btn no-outline">
               <span class="opacity-0 group-hover:opacity-100 text-[8px] text-white">−</span>
@@ -178,10 +183,6 @@ onMounted(() => {
                     <div v-if="player.likedQueue.length === 0" class="text-white/30 text-center mt-20 font-orbitron tracking-widest">EMPTY_VAULT</div>
                  </div>
               </div>
-              
-              <div v-else-if="activeTab === 'about'" class="absolute inset-0 z-20 flex flex-col">
-                  <AboutPage />
-              </div>
           </Transition>
 
           <div v-show="activeTab === 'dashboard' || activeTab === 'settings'" 
@@ -195,7 +196,19 @@ onMounted(() => {
           <SettingsPanel v-if="showSettings" @close="switchToMain" @notify="notify" />
         </div>
 
-        <PlayerControls :showLyrics="showLyrics" @toggle-lyrics="showLyrics = !showLyrics" />
+        <PlayerControls 
+          :class="activeTab === 'about' ? 'opacity-0 pointer-events-none translate-y-4' : 'opacity-100 translate-y-0'"
+          class="transition-all duration-500 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+          :showLyrics="showLyrics" 
+          @toggle-lyrics="showLyrics = !showLyrics" 
+        />
+
+        <Transition name="page-spring">
+          <div v-if="activeTab === 'about'" class="absolute top-16 bottom-0 left-0 right-0 z-[60] flex flex-col pointer-events-auto rounded-br-xl overflow-hidden">
+            <AboutPage />
+          </div>
+        </Transition>
+
       </section>
     </div>
 
@@ -262,7 +275,7 @@ button, input, select, [role="button"], .no-drag-btn { -webkit-app-region: no-dr
 /* 清除 Focus 轮廓线 */
 .no-outline:focus { outline: none; }
 
-/* 🔥 仅新增：贡献者界面的黑幕淡入淡出动画 */
+/* 贡献者界面的黑幕淡入淡出动画 */
 .credits-fade-enter-active, .credits-fade-leave-active { 
   transition: opacity 1.5s ease-in-out; 
 }

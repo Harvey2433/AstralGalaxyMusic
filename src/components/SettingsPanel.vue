@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted, onUnmounted } from 'vue';
 import { usePlayerStore } from '../stores/player';
 import { 
   Settings, Terminal, Sliders, Monitor, LogOut, 
   Activity, Cpu, Zap, HardDrive, Film, 
-  Loader2, AlertCircle, CheckCircle2, Speaker 
+  Loader2, AlertCircle, CheckCircle2, Speaker, ChevronDown 
 } from 'lucide-vue-next';
 
 const emit = defineEmits<{ (e: 'close'): void; (e: 'notify', text: string, type?: 'info' | 'error' | 'cooling'): void; }>();
@@ -13,6 +13,9 @@ const player = usePlayerStore();
 const activeSettingTab = ref('core');
 const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
+
+// 🔥 修复：自定义下拉框状态
+const isDeviceDropdownOpen = ref(false);
 
 const engines = [
   { id: 'galaxy', name: 'GalaxyCore', sub: 'HYPERION', icon: Cpu, color: 'text-starlight-cyan', border: 'border-starlight-cyan', glow: 'shadow-[0_0_15px_rgba(100,255,218,0.3)]', desc: 'Native Rust (Zero-Copy)' },
@@ -53,19 +56,17 @@ const setChannel = async (ch: number) => {
     }
 };
 
-const selectOutputDevice = async (e: Event) => { 
-    const target = e.target as HTMLSelectElement;
+// 🔥 修复：改进的设备选择逻辑
+const selectOutputDevice = async (deviceName: string) => { 
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
-        target.value = player.activeDevice;
         emit('notify', 'System busy: Engine locked', 'error');
         return;
     }
 
-    const res = await player.setOutputDevice(target.value); 
-    if (res === 'THROTTLED' || res === 'FAILED') {
-        target.value = player.activeDevice; 
-    } else if (res === 'SUCCESS') {
-        emit('notify', `Output: ${target.value}`);
+    const res = await player.setOutputDevice(deviceName); 
+    if (res === 'SUCCESS') {
+        emit('notify', `Output: ${deviceName}`);
+        isDeviceDropdownOpen.value = false;
     }
 };
 
@@ -88,6 +89,19 @@ const toggleSMTC = () => {
     localStorage.setItem('smtc_enabled', JSON.stringify(player.isSmtcEnabled));
     emit('notify', player.isSmtcEnabled ? 'Native SMTC enabled' : 'Native SMTC disabled');
 };
+
+// 🔥 修复：自动刷新设备列表
+let deviceUpdateTimer: any = null;
+onMounted(() => {
+    player.fetchDevices();
+    deviceUpdateTimer = setInterval(() => {
+        player.fetchDevices();
+    }, 5000);
+});
+
+onUnmounted(() => {
+    if (deviceUpdateTimer) clearInterval(deviceUpdateTimer);
+});
 </script>
 
 <template>
@@ -150,9 +164,28 @@ const toggleSMTC = () => {
                   <h3 class="text-2xl font-bold text-white mb-2">Audio Channels</h3>
                   <p class="text-sm text-white/40 mb-8">Configure output mapping for surround sound systems.</p>
 
-                  <div class="mb-8 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20">
+                  <div class="mb-8 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20 relative z-[100]">
                       <label class="text-xs font-bold text-starlight-cyan tracking-widest mb-3 block">OUTPUT DEVICE</label>
-                      <select @change="selectOutputDevice" class="w-full bg-black/50 border border-white/10 rounded-xl p-3 text-white text-sm focus:border-starlight-cyan outline-none transition-colors duration-300"><option v-for="dev in player.availableDevices" :key="dev" :value="dev" :selected="player.activeDevice === dev">{{ dev }}</option></select>
+                      
+                      <div class="relative">
+                          <button @click="isDeviceDropdownOpen = !isDeviceDropdownOpen" 
+                                  class="w-full bg-black/50 border border-white/10 rounded-xl p-3 px-4 text-white text-sm flex items-center justify-between hover:border-starlight-cyan/50 transition-all no-drag-btn no-outline">
+                              <span class="truncate">{{ player.activeDevice || 'Default' }}</span>
+                              <ChevronDown :size="16" class="text-white/40 transition-transform duration-300" :class="isDeviceDropdownOpen ? 'rotate-180' : ''" />
+                          </button>
+
+                          <Transition name="slide-up-fade">
+                              <div v-if="isDeviceDropdownOpen" 
+                                   class="absolute top-full left-0 right-0 mt-2 bg-cosmos-900/95 backdrop-blur-2xl border border-white/10 rounded-xl shadow-2xl overflow-hidden z-[110] max-h-60 overflow-y-auto scrollbar-hide">
+                                  <div v-for="dev in player.availableDevices" :key="dev" 
+                                       @click="selectOutputDevice(dev)"
+                                       class="p-3 px-4 text-sm text-white/70 hover:text-starlight-cyan hover:bg-starlight-cyan/10 cursor-pointer transition-colors flex items-center gap-2 border-b border-white/5 last:border-none">
+                                      <CheckCircle2 v-if="player.activeDevice === dev" :size="14" class="text-starlight-cyan" />
+                                      <span class="truncate">{{ dev }}</span>
+                                  </div>
+                              </div>
+                          </Transition>
+                      </div>
                   </div>
                   
                   <div class="grid grid-cols-3 gap-5 mb-6 p-2 -ml-2">

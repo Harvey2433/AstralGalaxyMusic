@@ -10,16 +10,14 @@ use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering}; 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{Window, Emitter, Manager}; 
 use zip::ZipArchive;
 use rodio::{OutputStreamHandle, Sink, Source, buffer::SamplesBuffer};
 
-// 🔥 引入 Windows 专属的进程扩展，用于隐藏控制台窗口
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-// 🔥 复用 Galaxy 的超级安全上混模块与配置
 use super::galaxy::{UpmixSource, ChannelConfig};
 
 pub struct FFmpegEngine {
@@ -29,7 +27,10 @@ pub struct FFmpegEngine {
     sample_rate: u32,
     target_volume: Arc<RwLock<f32>>, 
     fade_token: Arc<AtomicUsize>,
-    last_seek_pos: Arc<RwLock<f64>>,
+    
+    playback_pos: Arc<RwLock<f64>>,
+    last_play_instant: Arc<RwLock<Option<Instant>>>,
+    
     is_playing: Arc<AtomicBool>,
     channel_mode: Arc<RwLock<ChannelConfig>>,
 }
@@ -42,13 +43,22 @@ impl FFmpegEngine {
             sink: Arc::new(Mutex::new(sink)),
             stream_handle,
             current_samples: None,
-            sample_rate: 44100,
+            sample_rate: 44100, 
             target_volume: Arc::new(RwLock::new(1.0)), 
             fade_token: Arc::new(AtomicUsize::new(0)), 
-            last_seek_pos: Arc::new(RwLock::new(0.0)),
+            playback_pos: Arc::new(RwLock::new(0.0)),
+            last_play_instant: Arc::new(RwLock::new(None)),
             is_playing: Arc::new(AtomicBool::new(false)),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
         } 
+    }
+
+    pub fn get_current_time(&self) -> f64 {
+        let mut pos = *self.playback_pos.read().unwrap();
+        if let Some(inst) = *self.last_play_instant.read().unwrap() {
+            pos += inst.elapsed().as_secs_f64();
+        }
+        pos
     }
 
     fn get_ffmpeg_dir() -> PathBuf {
@@ -68,7 +78,6 @@ impl FFmpegEngine {
             let mut cmd = Command::new(&exe_path);
             cmd.arg("-version");
             
-            // 🔥 魔法注入：隐藏检查版本时的黑框
             #[cfg(target_os = "windows")]
             {
                 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -230,7 +239,20 @@ impl FFmpegEngine {
 }
 
 impl AudioEngine for FFmpegEngine {
-    fn name(&self) -> &str { "FFmpeg Pipe (with DSP)" }
+    fn name(&self) -> &str { "FFmpeg Pipe (High-Compat Bit-Perfect)" }
+
+    fn update_output_stream(&mut self, handle: OutputStreamHandle) {
+        let current_time = self.get_current_time();
+        self.stream_handle = handle.clone();
+        
+        // 🔥 绝杀修复：必须在 seek 前强行覆盖并同步销毁旧 Sink
+        if let Ok(new_sink) = Sink::try_new(&handle) {
+            let mut guard = self.sink.lock().unwrap();
+            *guard = new_sink;
+        }
+        
+        self.seek(current_time);
+    }
 
     fn load(&mut self, path: &str) -> Result<f64, String> {
         self.fade_token.fetch_add(1, Ordering::SeqCst);
@@ -241,10 +263,13 @@ impl AudioEngine for FFmpegEngine {
         
         let mut cmd = Command::new(&ffmpeg_exe);
         cmd.args(&[
-            "-i", path, "-f", "f32le", "-ac", "2", "-ar", "44100", 
-            "-vn", "-sn", "-map_metadata", "-1", "-v", "quiet", "pipe:1"
+            "-i", path, "-f", "f32le", "-ac", "2", 
+            "-ar", "44100", 
+            "-af", "aresample=resampler=swr:filter_type=cubic:precision=28,alimiter=limit=0.95:attack=5:release=50",
+            "-vn", "-sn", "-map_metadata", "-1", "-v", "error", "pipe:1"
         ])
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         #[cfg(target_os = "windows")]
         {
@@ -252,13 +277,19 @@ impl AudioEngine for FFmpegEngine {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn ffmpeg: {}", e))?;
 
-        let mut stdout = child.stdout.ok_or("Failed to open ffmpeg stdout")?;
+        let mut stdout = child.stdout.take().ok_or("Failed to open ffmpeg stdout")?;
+        let mut stderr = child.stderr.take().ok_or("Failed to open ffmpeg stderr")?;
+        
         let mut raw_bytes = Vec::new();
         stdout.read_to_end(&mut raw_bytes).map_err(|e| e.to_string())?;
 
-        if raw_bytes.is_empty() { return Err("FFmpeg output is empty.".to_string()); }
+        if raw_bytes.is_empty() { 
+            let mut err_msg = String::new();
+            stderr.read_to_string(&mut err_msg).ok();
+            return Err(format!("FFmpeg Pipe Failed: {}", err_msg)); 
+        }
 
         let sample_count = raw_bytes.len() / 4;
         let mut samples = Vec::with_capacity(sample_count);
@@ -269,8 +300,10 @@ impl AudioEngine for FFmpegEngine {
 
         let samples_arc = Arc::new(samples);
         self.current_samples = Some(samples_arc.clone());
-        self.sample_rate = 44100;
-        if let Ok(mut pos) = self.last_seek_pos.write() { *pos = 0.0; }
+        self.sample_rate = 44100; 
+        
+        *self.playback_pos.write().unwrap() = 0.0;
+        *self.last_play_instant.write().unwrap() = Some(Instant::now());
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
         let buffer = SamplesBuffer::new(2, 44100, samples_arc.to_vec());
@@ -291,18 +324,27 @@ impl AudioEngine for FFmpegEngine {
 
     fn play(&mut self) {
         self.is_playing.store(true, Ordering::SeqCst);
+        *self.last_play_instant.write().unwrap() = Some(Instant::now());
         self.run_fade_in(500);
     }
 
     fn pause(&mut self) {
         self.is_playing.store(false, Ordering::SeqCst);
+        let mut pos = self.playback_pos.write().unwrap();
+        let mut inst = self.last_play_instant.write().unwrap();
+        if let Some(i) = *inst {
+            *pos += i.elapsed().as_secs_f64();
+        }
+        *inst = None;
         self.run_fade_out_pause(500);
     }
 
     fn seek(&mut self, time: f64) {
-        if let Ok(mut pos) = self.last_seek_pos.write() { *pos = time; }
+        *self.playback_pos.write().unwrap() = time;
+        let is_playing_now = self.is_playing.load(Ordering::SeqCst);
+        *self.last_play_instant.write().unwrap() = if is_playing_now { Some(Instant::now()) } else { None };
+        
         self.fade_token.fetch_add(1, Ordering::SeqCst);
-        let should_be_playing = self.is_playing.load(Ordering::SeqCst);
 
         if let Some(samples_arc) = &self.current_samples {
              if let Ok(sink) = self.sink.lock() {
@@ -316,7 +358,7 @@ impl AudioEngine for FFmpegEngine {
                  let mixed = UpmixSource::new(new_source, target_channels);
                  sink.append(mixed);
                  
-                 if should_be_playing { drop(sink); self.run_fade_in(50); } 
+                 if is_playing_now { drop(sink); self.run_fade_in(50); } 
                  else {
                      sink.pause();
                      let target_vol = *self.target_volume.read().unwrap();
@@ -334,7 +376,6 @@ impl AudioEngine for FFmpegEngine {
         }
     }
 
-    // 🔥 解析前端传参：兼容真实的物理 106 / 108 模式
     fn set_channel_mode(&mut self, _mode: u16) {
         let config = match _mode {
             6 => ChannelConfig::Surround51, 
@@ -344,36 +385,5 @@ impl AudioEngine for FFmpegEngine {
             _ => ChannelConfig::Stereo,
         };
         *self.channel_mode.write().unwrap() = config;
-    }
-
-    fn update_output_stream(&mut self, handle: OutputStreamHandle) {
-        self.fade_token.fetch_add(1, Ordering::SeqCst);
-        self.stream_handle = handle.clone();
-        
-        if let Ok(new_sink) = Sink::try_new(&handle) {
-            let mut guard = self.sink.lock().unwrap();
-            let should_be_playing = self.is_playing.load(Ordering::SeqCst);
-            let seek_pos = *self.last_seek_pos.read().unwrap();
-            let target_vol = *self.target_volume.read().unwrap();
-            let target_channels = *self.channel_mode.read().unwrap() as u16;
-            
-            *guard = new_sink; 
-            
-            if let Some(samples_arc) = &self.current_samples {
-                let play_samples = samples_arc.to_vec();
-                let source = SamplesBuffer::new(2, self.sample_rate, play_samples);
-                let new_source = source.skip_duration(Duration::from_secs_f64(seek_pos));
-                let mixed = UpmixSource::new(new_source, target_channels);
-                guard.append(mixed);
-            }
-
-            if should_be_playing {
-                guard.set_volume(target_vol);
-                guard.play();
-            } else {
-                guard.set_volume(target_vol); 
-                guard.pause(); 
-            }
-        }
     }
 }
