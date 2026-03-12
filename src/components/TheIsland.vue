@@ -29,13 +29,13 @@ const currentIslandMode = computed(() => {
   return 'idle';
 });
 
-// 🔥 核心魔法：动态计算灵动岛宽度
+// 核心魔法：动态计算灵动岛宽度
 const islandWidth = computed(() => {
   if (currentIslandMode.value === 'idle') return '80px';
   if (currentIslandMode.value === 'media') return '260px';
   if (currentIslandMode.value === 'loading') return '110px';
   if (currentIslandMode.value === 'downloading') return '160px';
-  // 🔥 给 iOS 的 Leading/Trailing 布局流出足够的呼吸空间
+  // 给 iOS 的 Leading/Trailing 布局流出足够的呼吸空间
   if (currentIslandMode.value === 'importing') return '160px'; 
   if (currentIslandMode.value === 'notification') {
     const textWidth = notificationText.value.length * 8;
@@ -44,7 +44,7 @@ const islandWidth = computed(() => {
   return '220px';
 });
 
-// 🔥 核心魔法：动态计算灵动岛高度
+// 核心魔法：动态计算灵动岛高度
 const islandHeight = computed(() => {
   if (currentIslandMode.value === 'idle') return '20px';
   if (currentIslandMode.value === 'media') return '40px';

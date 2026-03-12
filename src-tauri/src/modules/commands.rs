@@ -3,8 +3,10 @@ use std::path::Path;
 use rfd::FileDialog;
 use rayon::prelude::*;
 use crate::audio::ffmpeg::FFmpegEngine;
+use crate::audio::AudioCommand; 
 use super::state::AppState;
 use super::utils::{extract_metadata, parse_lyrics_file};
+use tokio::sync::oneshot;
 
 #[tauri::command]
 pub async fn get_lyrics(path: String) -> Result<String, String> {
@@ -13,7 +15,6 @@ pub async fn get_lyrics(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn import_music(window: Window) -> Result<(), String> {
-    // 🔥 加上 set_parent(&window) 使其成为原生级别的模态窗口，彻底冻结并阻塞主程序！
     let files = FileDialog::new()
         .add_filter("Audio", &["mp3", "flac", "wav", "ogg", "m4a", "wma", "aac"])
         .set_directory("/")
@@ -31,7 +32,6 @@ pub async fn import_music(window: Window) -> Result<(), String> {
             let _ = window.emit("import-finish", ());
         });
     } else {
-        // 如果取消了选择，发送 cancel 解除前端的锁
         let _ = window.emit("import-cancel", ());
     }
     Ok(())
@@ -45,8 +45,9 @@ pub async fn init_audio_engine(window: Window, state: State<'_, AppState>, engin
     if engine_id == "ffmpeg" {
         let available = FFmpegEngine::check_availability(window.app_handle());
         if available {
-            state.audio_manager.lock().unwrap().switch_engine(&engine_id)?;
-            return Ok("ENGINE_FFMPEG_READY".to_string());
+            let (tx, rx) = oneshot::channel();
+            state.audio_tx.send(AudioCommand::SwitchEngine(engine_id.clone(), tx)).map_err(|e| e.to_string())?;
+            return rx.await.map_err(|e| e.to_string())?;
         } else {
             let win_clone = window.clone();
             tauri::async_runtime::spawn(async move {
@@ -58,44 +59,57 @@ pub async fn init_audio_engine(window: Window, state: State<'_, AppState>, engin
             return Ok("DOWNLOADING".to_string());
         }
     }
-    state.audio_manager.lock().unwrap().switch_engine(&engine_id)
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::SwitchEngine(engine_id, tx)).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn player_load_track(state: State<'_, AppState>, path: String) -> Result<f64, String> {
     if !Path::new(&path).exists() { return Err("FILE_NOT_FOUND".to_string()); }
-    let manager = state.audio_manager.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<f64, String> {
-        manager.lock().unwrap().load(&path)
-    }).await.map_err(|e| e.to_string())?
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::Load(path, tx)).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn player_play(state: State<AppState>) { state.audio_manager.lock().unwrap().play(); }
+pub fn player_play(state: State<AppState>) { let _ = state.audio_tx.send(AudioCommand::Play); }
 #[tauri::command]
-pub fn player_pause(state: State<AppState>) { state.audio_manager.lock().unwrap().pause(); }
+pub fn player_pause(state: State<AppState>) { let _ = state.audio_tx.send(AudioCommand::Pause); }
 
 #[tauri::command]
 pub async fn player_seek(window: Window, state: State<'_, AppState>, time: f64) -> Result<(), String> {
-    let manager = state.audio_manager.clone();
     let _ = window.emit("seek-start", ());
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        manager.lock().unwrap().seek(time);
-    }).await.map_err(|e| e.to_string());
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::Seek(time, tx)).map_err(|e| e.to_string())?;
+    let _ = rx.await;
     let _ = window.emit("seek-end", time);
-    result
+    Ok(())
 }
 
 #[tauri::command]
-pub fn player_set_volume(state: State<AppState>, vol: f32) { state.audio_manager.lock().unwrap().set_volume(vol); }
+pub fn player_set_volume(state: State<AppState>, vol: f32) { let _ = state.audio_tx.send(AudioCommand::SetVolume(vol)); }
 #[tauri::command]
-pub fn player_set_channels(state: State<AppState>, mode: u16) { state.audio_manager.lock().unwrap().set_channels(mode); }
+pub fn player_set_channels(state: State<AppState>, mode: u16) { let _ = state.audio_tx.send(AudioCommand::SetChannels(mode)); }
+
 #[tauri::command]
-pub fn get_output_devices(state: State<AppState>) -> Vec<String> { state.audio_manager.lock().unwrap().get_audio_devices() }
+pub async fn get_output_devices(state: State<'_, AppState>) -> Result<Vec<String>, String> { 
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::GetDevices(tx)).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-pub fn set_output_device(state: State<AppState>, device: String) -> Result<String, String> { state.audio_manager.lock().unwrap().set_audio_device(&device) }
+pub async fn set_output_device(state: State<'_, AppState>, device: String) -> Result<String, String> { 
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::SetDevice(device, tx)).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
-pub fn get_current_engine(state: State<AppState>) -> String {
-    let name = state.audio_manager.lock().unwrap().active_engine.name().to_string();
-    if name.contains("FFmpeg") { "ffmpeg".to_string() } else { "galaxy".to_string() }
+pub async fn get_current_engine(state: State<'_, AppState>) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::GetCurrentEngine(tx)).map_err(|e| e.to_string())?;
+    let name = rx.await.map_err(|e| e.to_string())?;
+    if name.contains("FFmpeg") { Ok("ffmpeg".to_string()) } else { Ok("galaxy".to_string()) }
 }

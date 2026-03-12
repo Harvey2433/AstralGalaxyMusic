@@ -3,6 +3,8 @@
 pub mod galaxy;
 pub mod ffmpeg;
 
+use tokio::sync::oneshot;
+use std::sync::mpsc::{self, Sender};
 use rodio::{OutputStream, OutputStreamHandle};
 use rodio::cpal::traits::{HostTrait, DeviceTrait};
 
@@ -22,6 +24,21 @@ pub trait AudioEngine: Send + Sync {
     fn update_output_stream(&mut self, _handle: OutputStreamHandle) {} 
 }
 
+// 🔥 核心重构：定义所有的异步指令小纸条
+pub enum AudioCommand {
+    Load(String, oneshot::Sender<Result<f64, String>>),
+    Play,
+    Pause,
+    Seek(f64, oneshot::Sender<()>),
+    SetVolume(f32),
+    SetChannels(u16),
+    GetDevices(oneshot::Sender<Vec<String>>),
+    SetDevice(String, oneshot::Sender<Result<String, String>>),
+    SwitchEngine(String, oneshot::Sender<Result<String, String>>),
+    GetCurrentEngine(oneshot::Sender<String>),
+    CheckDeviceStatus(oneshot::Sender<Option<String>>),
+}
+
 pub struct AudioManager {
     pub active_engine: Box<dyn AudioEngine>,
     _stream: Option<StreamHolder>, 
@@ -31,6 +48,34 @@ pub struct AudioManager {
 }
 
 impl AudioManager {
+    // 🔥 核心重构：无锁消息循环，彻底切断与 Tauri 线程的物理纠缠！
+    pub fn start_actor() -> Sender<AudioCommand> {
+        let (tx, rx) = mpsc::channel::<AudioCommand>();
+        
+        std::thread::spawn(move || {
+            let mut manager = AudioManager::new();
+            
+            // 永动监听循环：只负责接指令干活，就算卡死也只卡自己，前端照样 144Hz 丝滑运行
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    AudioCommand::Load(path, reply) => { let _ = reply.send(manager.load(&path)); }
+                    AudioCommand::Play => manager.play(),
+                    AudioCommand::Pause => manager.pause(),
+                    AudioCommand::Seek(time, reply) => { manager.seek(time); let _ = reply.send(()); }
+                    AudioCommand::SetVolume(vol) => manager.set_volume(vol),
+                    AudioCommand::SetChannels(mode) => manager.set_channels(mode),
+                    AudioCommand::GetDevices(reply) => { let _ = reply.send(manager.get_audio_devices()); }
+                    AudioCommand::SetDevice(device, reply) => { let _ = reply.send(manager.set_audio_device(&device)); }
+                    AudioCommand::SwitchEngine(engine_id, reply) => { let _ = reply.send(manager.switch_engine(&engine_id)); }
+                    AudioCommand::GetCurrentEngine(reply) => { let _ = reply.send(manager.active_engine.name().to_string()); }
+                    AudioCommand::CheckDeviceStatus(reply) => { let _ = reply.send(manager.check_device_status()); }
+                }
+            }
+        });
+        
+        tx
+    }
+
     pub fn new() -> Self {
         let host = rodio::cpal::default_host();
         let default_name = host.default_output_device()
@@ -48,6 +93,8 @@ impl AudioManager {
             last_resolved_default: default_name,
         }
     }
+
+    // ========== 下方底层业务逻辑保留了 100% 原始代码，没有任何妥协和缩水！ ==========
 
     pub fn check_device_status(&mut self) -> Option<String> {
         let host = rodio::cpal::default_host();
@@ -86,7 +133,6 @@ impl AudioManager {
                     self.last_resolved_default = current_default.clone();
                     
                     if let Ok((new_stream, new_handle)) = OutputStream::try_default() {
-                        // 🔥 绝杀修复：必须先让引擎切断旧的 Sink 羁绊，才能销毁底层 Stream
                         self.active_engine.update_output_stream(new_handle.clone());
                         self._stream = Some(StreamHolder(new_stream));
                         self.stream_handle = new_handle;
@@ -115,7 +161,6 @@ impl AudioManager {
                 .unwrap_or_else(|| "Unknown".to_string());
 
             let (stream, stream_handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
-            // 🔥 绝杀修复：先替换引擎中的 Sink（同步销毁旧 Sink），再丢弃旧的 OutputStream
             self.active_engine.update_output_stream(stream_handle.clone());
             self._stream = Some(StreamHolder(stream));
             self.stream_handle = stream_handle;
@@ -129,7 +174,6 @@ impl AudioManager {
         if let Some(device) = device {
             match OutputStream::try_from_device(&device) {
                 Ok((new_stream, new_handle)) => {
-                    // 🔥 绝杀修复：严格保证 drop 顺序，杜绝 WASAPI 死锁
                     self.active_engine.update_output_stream(new_handle.clone());
                     self._stream = Some(StreamHolder(new_stream)); 
                     self.stream_handle = new_handle;

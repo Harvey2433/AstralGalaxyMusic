@@ -14,7 +14,7 @@ const activeSettingTab = ref('core');
 const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
 
-// 🔥 修复：自定义下拉框状态
+// 修复：自定义下拉框状态
 const isDeviceDropdownOpen = ref(false);
 
 const engines = [
@@ -56,7 +56,7 @@ const setChannel = async (ch: number) => {
     }
 };
 
-// 🔥 修复：改进的设备选择逻辑
+// 修复：改进的设备选择逻辑
 const selectOutputDevice = async (deviceName: string) => { 
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
         emit('notify', 'System busy: Engine locked', 'error');
@@ -90,7 +90,7 @@ const toggleSMTC = () => {
     emit('notify', player.isSmtcEnabled ? 'Native SMTC enabled' : 'Native SMTC disabled');
 };
 
-// 🔥 修复：自动刷新设备列表
+// 修复：自动刷新设备列表
 let deviceUpdateTimer: any = null;
 onMounted(() => {
     player.fetchDevices();

@@ -3,12 +3,12 @@
 mod audio;
 mod modules;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use audio::AudioManager;
 use modules::state::AppState;
 use modules::commands::*; 
 
-use tauri::{Manager, Emitter, Listener, Runtime}; 
+use tauri::{Manager, Emitter, Listener}; 
 use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use base64::{Engine as _, engine::general_purpose};
@@ -28,7 +28,7 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
     use windows::Media::{SystemMediaTransportControls, MediaPlaybackType};
-    use windows::core::{Interface, HSTRING};
+    use windows::core::HSTRING;
     use windows::Storage::StorageFile;
     use windows::Storage::Streams::RandomAccessStreamReference;
     use std::path::Path;
@@ -71,7 +71,6 @@ async fn toggle_smtc_active(handle: tauri::State<'_, SmtcHandle>, enable: bool) 
         use windows::Win32::Foundation::HWND;
         use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
         use windows::Media::SystemMediaTransportControls;
-        use windows::core::Interface;
 
         let hwnd = HWND(handle.hwnd_ptr as *mut core::ffi::c_void);
         if let Ok(interop) = windows::core::factory::<SystemMediaTransportControls, ISystemMediaTransportControlsInterop>() {
@@ -181,15 +180,13 @@ async fn sync_smtc_status(handle: tauri::State<'_, SmtcHandle>, is_playing: bool
 fn main() {
     log_smtc(">>> Astral Galaxy Music Player Backend Started <<<");
     
-    let audio_manager = Arc::new(Mutex::new(AudioManager::new()));
-    
-    // 🔥 硬件哨兵线程克隆引用
-    let am_monitor = audio_manager.clone();
+    let audio_tx = AudioManager::start_actor();
+    let tx_monitor = audio_tx.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState { audio_manager })
+        .manage(AppState { audio_tx })
         .setup(move |app| {
             let main_window = app.get_webview_window("main").unwrap();
             let app_handle = app.handle().clone();
@@ -206,31 +203,24 @@ fn main() {
                 println!("[NATIVE] Window securely shown and focused.");
             });
 
-            // 🔥 独立后台哨兵：绝对不阻塞前端，由前端主导暂停与恢复
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1500));
                     
-                    let target_device = {
-                        let mut am = am_monitor.lock().unwrap();
-                        am.check_device_status()
-                    };
-                    
-                    if let Some(device) = target_device {
-                        println!("[AUDIO] Hardware Topology Changed! Syncing to frontend for Safe Migration to: {}", device);
-                        
-                        // 1. 同步前端，强制 UI 暂停（解除锁，防止死锁）
-                        let _ = app_handle.emit("force-pause", ());
-                        std::thread::sleep(std::time::Duration::from_millis(250)); 
-                        
-                        // 2. 重新获取锁，执行底层切换并无缝重建缓冲队列
-                        {
-                            let mut am = am_monitor.lock().unwrap();
-                            let _ = am.set_audio_device(&device);
+                    let (req_tx, req_rx) = tokio::sync::oneshot::channel();
+                    if tx_monitor.send(audio::AudioCommand::CheckDeviceStatus(req_tx)).is_ok() {
+                        if let Ok(Some(device)) = req_rx.blocking_recv() {
+                            println!("[AUDIO] Hardware Topology Changed! Syncing to frontend for Safe Migration to: {}", device);
+                            
+                            let _ = app_handle.emit("force-pause", ());
+                            std::thread::sleep(std::time::Duration::from_millis(250)); 
+                            
+                            let (set_tx, set_rx) = tokio::sync::oneshot::channel();
+                            let _ = tx_monitor.send(audio::AudioCommand::SetDevice(device, set_tx));
+                            let _ = set_rx.blocking_recv(); 
+                            
+                            let _ = app_handle.emit("force-play", ());
                         }
-                        
-                        // 3. 同步前端，恢复播放
-                        let _ = app_handle.emit("force-play", ());
                     }
                 }
             });

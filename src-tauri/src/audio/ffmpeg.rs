@@ -2,13 +2,13 @@
 
 use super::AudioEngine;
 use std::process::{Command, Stdio};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
 use tokio::time::timeout;
 use std::env;
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering}; 
+use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU32, Ordering}; 
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{Window, Emitter, Manager}; 
@@ -25,31 +25,30 @@ pub struct FFmpegEngine {
     stream_handle: OutputStreamHandle,
     current_samples: Option<Arc<Vec<f32>>>, 
     sample_rate: u32,
-    target_volume: Arc<RwLock<f32>>, 
-    fade_token: Arc<AtomicUsize>,
+    current_volume: Arc<AtomicU32>, 
     
     playback_pos: Arc<RwLock<f64>>,
     last_play_instant: Arc<RwLock<Option<Instant>>>,
     
     is_playing: Arc<AtomicBool>,
     channel_mode: Arc<RwLock<ChannelConfig>>,
+    fade_token: Arc<AtomicUsize>,
 }
 
 impl FFmpegEngine {
     pub fn new(stream_handle: OutputStreamHandle) -> Self { 
         let sink = Sink::try_new(&stream_handle).expect("Failed to create FFmpeg Sink");
-        sink.set_volume(0.0);
         Self { 
             sink: Arc::new(Mutex::new(sink)),
             stream_handle,
             current_samples: None,
             sample_rate: 44100, 
-            target_volume: Arc::new(RwLock::new(1.0)), 
-            fade_token: Arc::new(AtomicUsize::new(0)), 
+            current_volume: Arc::new(AtomicU32::new(1f32.to_bits())), 
             playback_pos: Arc::new(RwLock::new(0.0)),
             last_play_instant: Arc::new(RwLock::new(None)),
             is_playing: Arc::new(AtomicBool::new(false)),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
+            fade_token: Arc::new(AtomicUsize::new(0)),
         } 
     }
 
@@ -181,83 +180,27 @@ impl FFmpegEngine {
             Err("FFmpeg 核心校验失败，请重试".to_string()) 
         }
     }
-
-    fn run_fade_in(&self, duration_ms: u64) {
-        let sink_clone = self.sink.clone();
-        let target_vol_lock = self.target_volume.clone();
-        let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
-        let token_ref = self.fade_token.clone();
-
-        if let Ok(sink) = sink_clone.lock() {
-            if sink.empty() { return; }
-            sink.set_volume(0.0); 
-            sink.play();
-        }
-
-        thread::spawn(move || {
-            let target_vol = *target_vol_lock.read().unwrap();
-            if target_vol <= 0.001 { return; }
-            let step_time = 15; 
-            let steps = (duration_ms / step_time).max(1); 
-            let step_duration = Duration::from_millis(step_time);
-            
-            for i in 1..=steps {
-                if token_ref.load(Ordering::SeqCst) != my_token { return; }
-                let current_vol = target_vol * (i as f32 / steps as f32);
-                if let Ok(sink) = sink_clone.lock() { sink.set_volume(current_vol); }
-                thread::sleep(step_duration);
-            }
-            if token_ref.load(Ordering::SeqCst) == my_token {
-                if let Ok(sink) = sink_clone.lock() { sink.set_volume(target_vol); }
-            }
-        });
-    }
-
-    fn run_fade_out_pause(&self, duration_ms: u64) {
-        let sink_clone = self.sink.clone();
-        let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
-        let token_ref = self.fade_token.clone();
-
-        thread::spawn(move || {
-            let start_vol = if let Ok(sink) = sink_clone.lock() { sink.volume() } else { return; };
-            let step_time = 15;
-            let steps = (duration_ms / step_time).max(1);
-            let step_duration = Duration::from_millis(step_time);
-
-            for i in 0..steps {
-                if token_ref.load(Ordering::SeqCst) != my_token { return; }
-                let remaining_factor = 1.0 - (i as f32 / steps as f32);
-                let current_vol = start_vol * remaining_factor;
-                if let Ok(sink) = sink_clone.lock() { sink.set_volume(current_vol); }
-                thread::sleep(step_duration);
-            }
-            if token_ref.load(Ordering::SeqCst) == my_token {
-                if let Ok(sink) = sink_clone.lock() { sink.pause(); }
-            }
-        });
-    }
 }
 
 impl AudioEngine for FFmpegEngine {
     fn name(&self) -> &str { "FFmpeg Pipe (High-Compat Bit-Perfect)" }
 
     fn update_output_stream(&mut self, handle: OutputStreamHandle) {
-        let current_time = self.get_current_time();
-        self.stream_handle = handle.clone();
-        
-        // 🔥 绝杀修复：必须在 seek 前强行覆盖并同步销毁旧 Sink
-        if let Ok(new_sink) = Sink::try_new(&handle) {
-            let mut guard = self.sink.lock().unwrap();
-            *guard = new_sink;
+        if self.is_playing.load(Ordering::SeqCst) {
+            self.is_playing.store(false, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(40)); 
         }
         
+        let current_time = self.get_current_time();
+        self.stream_handle = handle.clone();
         self.seek(current_time);
     }
 
     fn load(&mut self, path: &str) -> Result<f64, String> {
-        self.fade_token.fetch_add(1, Ordering::SeqCst);
-        self.is_playing.store(true, Ordering::SeqCst);
-        if let Ok(sink) = self.sink.lock() { sink.stop(); }
+        if self.is_playing.load(Ordering::SeqCst) {
+            self.is_playing.store(false, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(40)); 
+        }
 
         let ffmpeg_exe = Self::get_ffmpeg_exe();
         
@@ -303,77 +246,95 @@ impl AudioEngine for FFmpegEngine {
         self.sample_rate = 44100; 
         
         *self.playback_pos.write().unwrap() = 0.0;
-        *self.last_play_instant.write().unwrap() = Some(Instant::now());
+        *self.last_play_instant.write().unwrap() = if self.is_playing.load(Ordering::SeqCst) { Some(Instant::now()) } else { None };
+
+        self.fade_token.fetch_add(1, Ordering::SeqCst);
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
         let buffer = SamplesBuffer::new(2, 44100, samples_arc.to_vec());
         let duration = buffer.total_duration().unwrap_or(Duration::from_secs(0)).as_secs_f64();
 
-        let mut sink = self.sink.lock().unwrap();
-        if !sink.empty() { sink.stop(); }
-        *sink = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
+        let mut sink_guard = self.sink.lock().unwrap();
+        *sink_guard = Sink::try_new(&self.stream_handle).map_err(|e| e.to_string())?;
         
-        let mixed = UpmixSource::new(buffer, target_channels);
-        sink.append(mixed);
+        sink_guard.set_volume(1.0);
+        let mixed = UpmixSource::new(buffer, target_channels, self.is_playing.clone(), self.current_volume.clone());
+        sink_guard.append(mixed);
         
-        drop(sink); 
-        self.run_fade_in(150);
+        sink_guard.play();
 
         Ok(duration)
     }
 
     fn play(&mut self) {
-        self.is_playing.store(true, Ordering::SeqCst);
+        if self.is_playing.swap(true, Ordering::SeqCst) { return; }
+        
         *self.last_play_instant.write().unwrap() = Some(Instant::now());
-        self.run_fade_in(500);
+        self.fade_token.fetch_add(1, Ordering::SeqCst); 
+        
+        if let Ok(s) = self.sink.lock() { s.play(); } 
     }
 
     fn pause(&mut self) {
-        self.is_playing.store(false, Ordering::SeqCst);
+        if !self.is_playing.swap(false, Ordering::SeqCst) { return; }
+        
         let mut pos = self.playback_pos.write().unwrap();
-        let mut inst = self.last_play_instant.write().unwrap();
-        if let Some(i) = *inst {
+        if let Some(i) = self.last_play_instant.write().unwrap().take() {
             *pos += i.elapsed().as_secs_f64();
         }
-        *inst = None;
-        self.run_fade_out_pause(500);
+
+        let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
+        let token_ref = self.fade_token.clone();
+        let sink_clone = self.sink.clone();
+        let is_playing_flag = self.is_playing.clone();
+        
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1000)); 
+            if token_ref.load(Ordering::SeqCst) == my_token && !is_playing_flag.load(Ordering::SeqCst) {
+                if let Ok(s) = sink_clone.lock() { s.pause(); } 
+            }
+        });
     }
 
     fn seek(&mut self, time: f64) {
-        *self.playback_pos.write().unwrap() = time;
         let is_playing_now = self.is_playing.load(Ordering::SeqCst);
+
+        // 🔥 死前平滑机制：阻断断头台效应
+        if is_playing_now {
+            self.is_playing.store(false, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(40)); 
+        }
+
+        *self.playback_pos.write().unwrap() = time;
         *self.last_play_instant.write().unwrap() = if is_playing_now { Some(Instant::now()) } else { None };
-        
-        self.fade_token.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let mut sink_guard = self.sink.lock().unwrap();
+            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+            sink_guard.pause(); 
+        }
+
+        let target_channels = *self.channel_mode.read().unwrap() as u16;
+        let sink_guard = self.sink.lock().unwrap();
 
         if let Some(samples_arc) = &self.current_samples {
-             if let Ok(sink) = self.sink.lock() {
-                 sink.stop(); 
-                 
-                 let target_channels = *self.channel_mode.read().unwrap() as u16;
-                 let play_samples = samples_arc.to_vec();
-                 let source = SamplesBuffer::new(2, self.sample_rate, play_samples);
-                 let new_source = source.skip_duration(Duration::from_secs_f64(time));
-                 
-                 let mixed = UpmixSource::new(new_source, target_channels);
-                 sink.append(mixed);
-                 
-                 if is_playing_now { drop(sink); self.run_fade_in(50); } 
-                 else {
-                     sink.pause();
-                     let target_vol = *self.target_volume.read().unwrap();
-                     sink.set_volume(target_vol);
-                 }
-             }
+             let play_samples = samples_arc.to_vec();
+             let source = SamplesBuffer::new(2, self.sample_rate, play_samples);
+             let new_source = source.skip_duration(Duration::from_secs_f64(time));
+             
+             sink_guard.set_volume(1.0);
+             let mixed = UpmixSource::new(new_source, target_channels, self.is_playing.clone(), self.current_volume.clone());
+             sink_guard.append(mixed);
+        }
+
+        if is_playing_now {
+            self.is_playing.store(true, Ordering::SeqCst);
+            sink_guard.play(); 
         }
     }
 
     fn set_volume(&mut self, vol: f32) {
-        if let Ok(mut v) = self.target_volume.write() { *v = vol; }
-        let should_be_playing = self.is_playing.load(Ordering::SeqCst);
-        if let Ok(sink) = self.sink.lock() { 
-            if should_be_playing { sink.set_volume(vol); }
-        }
+        self.current_volume.store(vol.to_bits(), Ordering::SeqCst);
     }
 
     fn set_channel_mode(&mut self, _mode: u16) {

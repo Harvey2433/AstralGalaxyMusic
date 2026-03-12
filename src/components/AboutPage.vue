@@ -19,7 +19,7 @@ const player = usePlayerStore();
     <div class="w-80 space-y-4 text-[11px] font-mono tracking-widest">
         <div class="flex justify-between border-b border-white/5 pb-2">
             <span class="text-white/30 uppercase">Version</span>
-            <span class="text-white">2.0.0-Beta</span>
+            <span class="text-white">2.2.0-Alpha</span>
         </div>
         <div class="flex justify-between border-b border-white/5 pb-2">
             <span class="text-white/30 uppercase">Codename</span>
@@ -31,7 +31,7 @@ const player = usePlayerStore();
         </div>
         <div class="flex justify-between border-b border-white/5 pb-2">
             <span class="text-white/30 uppercase">Build Time</span>
-            <span class="text-white">2026-03-10</span>
+            <span class="text-white">2026-03-13</span>
         </div>
     </div>
 
