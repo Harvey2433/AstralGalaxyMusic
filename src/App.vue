@@ -57,7 +57,7 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
 };
 
 // ==========================================
-// 🔥 Windows SMTC 状态实时同步 (终极懒加载分离版)
+// 🔥 Windows SMTC 状态实时同步
 // ==========================================
 let isSmtcActiveInBackend = false; 
 
@@ -93,7 +93,7 @@ watch(
 );
 
 // ==========================================
-// 🚀 初始化与系统环境封印 (修复窗口消失 Bug)
+// 🚀 初始化与系统环境封印
 // ==========================================
 onMounted(() => { 
   document.oncontextmenu = (e) => { e.preventDefault(); return false; };
@@ -106,7 +106,6 @@ onMounted(() => {
 
   setTimeout(() => {
     
-    // 🔥 妹妹的赎罪：把丢失的 emit('webview-ready') 完整补回来了！必须用这个通知后端！
     emit('webview-ready').then(() => {
       console.log("[TAURI] Ready signal sent to backend.");
     }).catch(err => console.error("[TAURI] Failed to send ready signal:", err));
@@ -115,9 +114,21 @@ onMounted(() => {
         listen('smtc-toggle', () => player.togglePlay()),
         listen('smtc-next', () => player.nextTrack()),
         listen('smtc-prev', () => player.prevTrack()),
-        // 🔥 时空哨兵指令：接收后端时停恢复指令，全自动同步 UI
-        listen('force-pause', () => { if (player.isPlaying) player.togglePlay(); }),
-        listen('force-play', () => { if (!player.isPlaying) player.togglePlay(); })
+        
+        // 🔥 终极修补：以后端硬件信号驱动前端总线锁
+        listen('force-pause', () => { 
+            // 立即开启“灵动岛”Process拦截，防止用户在自动切换时乱点
+            player.isSystemBusy = true;
+            player.isBuffering = true;
+            if (player.isPlaying) player.togglePlay(); 
+        }),
+        
+        listen('force-play', () => { 
+            // 硬件迁移完成，释放总线锁
+            player.isSystemBusy = false;
+            player.isBuffering = false;
+            if (!player.isPlaying) player.togglePlay(); 
+        })
     ]).catch(e => console.error("[TAURI] Event listener bind failed:", e));
 
     notify('Astral Galaxy Music Player'); 
