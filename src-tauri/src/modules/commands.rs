@@ -113,3 +113,10 @@ pub async fn get_current_engine(state: State<'_, AppState>) -> Result<String, St
     let name = rx.await.map_err(|e| e.to_string())?;
     if name.contains("FFmpeg") { Ok("ffmpeg".to_string()) } else { Ok("galaxy".to_string()) }
 }
+
+#[tauri::command]
+pub async fn get_current_time(state: State<'_, AppState>) -> Result<f64, String> {
+    let (tx, rx) = oneshot::channel();
+    state.audio_tx.send(AudioCommand::GetCurrentTime(tx)).map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())
+}

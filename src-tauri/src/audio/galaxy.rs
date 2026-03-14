@@ -2,8 +2,8 @@ use super::AudioEngine;
 use rodio::{Decoder, OutputStreamHandle, Sink, Source};
 use std::fs::File;
 use std::io::{Cursor, Read};
-use std::sync::{Arc, RwLock, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, RwLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::thread;
 
@@ -16,6 +16,19 @@ macro_rules! debug_log {
         println!("\x1b[36m[GALAXY][T:{}] {}\x1b[0m", thread_id, format!($($arg)*));
     })
 }
+
+// =================================================================
+// ⏱️ 全局高精度原子时钟基准 (Lock-Free Epoch)
+// =================================================================
+static TIME_EPOCH: OnceLock<Instant> = OnceLock::new();
+#[inline(always)]
+fn get_time_epoch() -> Instant {
+    *TIME_EPOCH.get_or_init(Instant::now)
+}
+#[inline(always)]
+fn f64_to_bits(f: f64) -> u64 { f.to_bits() }
+#[inline(always)]
+fn f64_from_bits(b: u64) -> f64 { f64::from_bits(b) }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ChannelConfig {
@@ -265,16 +278,14 @@ impl<I: Source<Item = f32>> UpmixSource<I> {
         }
     }
 
-    // 🔥 终极修复：驯服“反相抑制”
-    // 拔掉所有的额外增益，将保护阈值推到 0.98，仅作为防爆砖！
     #[inline(always)]
     fn audiophile_limiter(mut val: f32) -> f32 {
         let abs_val = val.abs();
         if abs_val <= 0.98 {
-            val // 0.98 以内，原汁原味，零修改！
+            val 
         } else {
             let diff = abs_val - 0.98;
-            val.signum() * (0.98 + diff / (1.0 + diff * 8.0)) // 极硬拐点，仅在要爆破时才出手
+            val.signum() * (0.98 + diff / (1.0 + diff * 8.0)) 
         }
     }
 }
@@ -352,12 +363,6 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
                 if self.target_channels == 8 {
                     self.current_frame.push(Self::audiophile_limiter(rear_l_raw * 0.8 * final_gain)); 
                     self.current_frame.push(Self::audiophile_limiter(rear_r_raw * 0.8 * final_gain)); 
-                } else {
-                    // 🔥 核心修复：如果是 5.1 模式，我们强行压入 2 个静音采样！
-                    // 作用：将 6 个采样补齐到 8 个采样（偶数对齐），彻底消灭声道漂移导致的电音！
-                    // 这样即便在双声道耳机下，Rodio 也能永远精准抓到 L 和 R，而不会把 C 抓给你的耳朵！
-                    self.current_frame.push(0.0); // 填充位 1 (Fake BL)
-                    self.current_frame.push(0.0); // 填充位 2 (Fake BR)
                 }
             }
             self.current_frame.reverse(); 
@@ -426,8 +431,8 @@ pub struct GalaxyEngine {
     channels: u16,
     current_volume: Arc<AtomicU32>, 
     channel_mode: Arc<RwLock<ChannelConfig>>,
-    playback_pos: Arc<RwLock<f64>>,
-    last_play_instant: Arc<RwLock<Option<Instant>>>,
+    playback_pos: Arc<AtomicU64>,
+    last_play_us: Arc<AtomicU64>, 
     fade_token: Arc<AtomicUsize>, 
 }
 
@@ -446,8 +451,8 @@ impl GalaxyEngine {
             channels: 2,
             current_volume: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
-            playback_pos: Arc::new(RwLock::new(0.0)),
-            last_play_instant: Arc::new(RwLock::new(None)),
+            playback_pos: Arc::new(AtomicU64::new(f64_to_bits(0.0))),
+            last_play_us: Arc::new(AtomicU64::new(u64::MAX)),
             fade_token: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -456,27 +461,40 @@ impl GalaxyEngine {
         let cursor = Cursor::new(data.to_vec()); 
         Decoder::new(cursor).map_err(|e| e.to_string())
     }
-
-    pub fn get_current_time(&self) -> f64 {
-        let mut pos = *self.playback_pos.read().unwrap();
-        if let Some(inst) = *self.last_play_instant.read().unwrap() {
-            pos += inst.elapsed().as_secs_f64();
-        }
-        pos
-    }
 }
 
 impl AudioEngine for GalaxyEngine {
     fn name(&self) -> &str { "Galaxy DSP (Adaptive Sync Core)" }
 
-    fn update_output_stream(&mut self, handle: OutputStreamHandle) {
-        if self.is_playing.load(Ordering::SeqCst) {
-            self.is_playing.store(false, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(40)); 
+    fn get_current_time(&self) -> f64 {
+        let pos = f64_from_bits(self.playback_pos.load(Ordering::Relaxed));
+        let start_us = self.last_play_us.load(Ordering::Relaxed);
+        if start_us != u64::MAX {
+            let epoch = get_time_epoch();
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            let elapsed = now_us.saturating_sub(start_us) as f64 / 1_000_000.0;
+            pos + elapsed
+        } else {
+            pos
         }
-        let current_time = self.get_current_time();
+    }
+
+    fn update_output_stream(&mut self, handle: OutputStreamHandle) {
+        let was_playing = self.is_playing.load(Ordering::SeqCst);
+        let current_time = (self.get_current_time() - 0.4).max(0.0);
+
+        if was_playing {
+            self.is_playing.store(false, Ordering::SeqCst);
+            if let Ok(s) = self.sink.lock() { s.pause(); }
+            thread::sleep(Duration::from_millis(50)); 
+        }
+        
         self.stream_handle = handle.clone();
         self.seek(current_time);
+
+        if was_playing {
+            self.play();
+        }
     }
 
     fn load(&mut self, path: &str) -> Result<f64, String> {
@@ -493,6 +511,8 @@ impl AudioEngine for GalaxyEngine {
 
         let source = Self::create_decoder(&raw_bytes)?;
         
+        debug_log!("Audio Engine Decoder Initialized: Source SR = {}Hz, Channels = {}", source.sample_rate(), source.channels());
+        
         let target_sr = get_dynamic_target_sr();
         let hq_source = RubatoSource::new(source.convert_samples::<f32>(), target_sr);
         
@@ -504,8 +524,14 @@ impl AudioEngine for GalaxyEngine {
         *self.decoded_samples.write().unwrap() = None;
         self.is_decoded.store(false, Ordering::Release);
         
-        *self.playback_pos.write().unwrap() = 0.0;
-        *self.last_play_instant.write().unwrap() = if self.is_playing.load(Ordering::SeqCst) { Some(Instant::now()) } else { None };
+        self.playback_pos.store(f64_to_bits(0.0), Ordering::SeqCst);
+        let epoch = get_time_epoch();
+        if self.is_playing.load(Ordering::SeqCst) {
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            self.last_play_us.store(now_us, Ordering::SeqCst);
+        } else {
+            self.last_play_us.store(u64::MAX, Ordering::SeqCst);
+        }
 
         self.fade_token.fetch_add(1, Ordering::SeqCst); 
 
@@ -527,8 +553,6 @@ impl AudioEngine for GalaxyEngine {
         let bg_target_sr = target_sr; 
 
         thread::spawn(move || {
-            // 🔥 修复：取消后台解码线程的 MMCSS 特权！
-            // 绝不允许它和实时播放线程抢夺 CPU，让它乖乖在 Normal 优先级跑！
             debug_log!("Background full-decode thread started (Normal Priority to protect real-time stream!).");
             
             if let Ok(decoder) = Decoder::new(Cursor::new(raw_bytes_clone.to_vec())) {
@@ -559,15 +583,32 @@ impl AudioEngine for GalaxyEngine {
 
     fn play(&mut self) { 
         if self.is_playing.swap(true, Ordering::SeqCst) { return; }
-        *self.last_play_instant.write().unwrap() = Some(Instant::now());
+        let epoch = get_time_epoch();
+        let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+        self.last_play_us.store(now_us, Ordering::SeqCst);
+        
         self.fade_token.fetch_add(1, Ordering::SeqCst); 
         if let Ok(s) = self.sink.lock() { s.play(); } 
     }
     
     fn pause(&mut self) { 
         if !self.is_playing.swap(false, Ordering::SeqCst) { return; }
-        let mut pos = self.playback_pos.write().unwrap();
-        if let Some(i) = self.last_play_instant.write().unwrap().take() { *pos += i.elapsed().as_secs_f64(); }
+        
+        let start_us = self.last_play_us.swap(u64::MAX, Ordering::SeqCst);
+        if start_us != u64::MAX {
+            let epoch = get_time_epoch();
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            let elapsed = now_us.saturating_sub(start_us) as f64 / 1_000_000.0;
+            
+            let mut current = self.playback_pos.load(Ordering::Relaxed);
+            loop {
+                let new_val = f64_from_bits(current) + elapsed;
+                match self.playback_pos.compare_exchange_weak(current, f64_to_bits(new_val), Ordering::SeqCst, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => current = x,
+                }
+            }
+        }
 
         let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
         let token_ref = self.fade_token.clone();
@@ -589,8 +630,14 @@ impl AudioEngine for GalaxyEngine {
             if let Ok(s) = self.sink.lock() { s.pause(); }
         }
 
-        *self.playback_pos.write().unwrap() = time;
-        *self.last_play_instant.write().unwrap() = if is_playing_now { Some(Instant::now()) } else { None };
+        self.playback_pos.store(f64_to_bits(time), Ordering::SeqCst);
+        let epoch = get_time_epoch();
+        if is_playing_now {
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            self.last_play_us.store(now_us, Ordering::SeqCst);
+        } else {
+            self.last_play_us.store(u64::MAX, Ordering::SeqCst);
+        }
 
         if !self.is_decoded.load(Ordering::Acquire) {
             debug_log!("Seek triggered before full-decode complete. Synchronously waiting for background process...");

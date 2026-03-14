@@ -26,6 +26,8 @@ export const usePlayerStore = defineStore('player', () => {
   const playSessionId = ref(0);    
   const isTrackSwitching = ref(false);
 
+  const isSystemBusy = ref(false);
+
   const isImporting = ref(false);
   const importCount = ref(0);
   const importTotal = ref(0);
@@ -33,41 +35,34 @@ export const usePlayerStore = defineStore('player', () => {
 
   let actionTimeoutId: any = null;
   let coolingTimerId: any = null;
+  let syncTimerId: any = null;
 
   const lastActiveVolume = ref(Number(localStorage.getItem('last_active_vol') || '80'));
   const notifyUI = ref<NotificationCallback | null>(null);
   const setNotifier = (fn: NotificationCallback) => { notifyUI.value = fn; };
 
-  // ==========================================
-  // 🔥 终极重构：防爆状态机与无缝淡入淡出引擎
-  // ==========================================
   let fadeRafId: number | null = null;
-  let actualVolume = 0.0;     // 记录底层真实的当前音量，作为一切无缝衔接的绝对基准
-  let lastIpcTime = 0;        // IPC 防风暴节流阀，保护后端不被饿死
-  let playActionSession = 0;  // 异步并发锁，解决高频 SMTC 和狂点鼠标导致的逻辑竞态
+  let actualVolume = 0.0;     
+  let lastIpcTime = 0;        
+  let playActionSession = 0;  
 
-  // 统一的底层音量发送口
   const setBackendVolume = (v: number) => {
+      if (isSystemBusy.value) return; 
       actualVolume = Math.max(0, Math.min(1, v));
-      // 🔥 大道至简：最高给到 0.5 (-6dB) 的黄金动态余量！
-      // 配合 2 次幂对数曲线，留足空间给 Windows 音效插件折腾，彻底消灭削波撕裂
-      const logVol = Math.pow(actualVolume, 2) * 0.5; 
+      const logVol = Math.pow(actualVolume, 2); 
       invoke('player_set_volume', { vol: logVol }).catch(()=>{});
       lastIpcTime = performance.now();
   };
 
   const smoothVolumeTransition = (targetVol: number, duration: number, onComplete?: () => void) => {
-      // 1. 如果有正在执行的动画，立即砍掉，准备无缝接管
       if (fadeRafId !== null) {
           cancelAnimationFrame(fadeRafId);
           fadeRafId = null;
       }
 
-      // 2. 从当前真实音量起步，保证不管是在淡出中途被打断还是播放中调整，都绝对平滑
       const startVol = actualVolume;
       const diff = targetVol - startVol;
 
-      // 如果差距极小或不需要过渡，直接瞬发
       if (Math.abs(diff) < 0.001 || duration <= 0) {
           setBackendVolume(targetVol);
           if (onComplete) onComplete();
@@ -81,12 +76,10 @@ export const usePlayerStore = defineStore('player', () => {
           const elapsed = timestamp - startTime;
           let fadeProgress = Math.min(elapsed / duration, 1.0);
 
-          // 计算当前帧理论音量
           actualVolume = startVol + diff * fadeProgress;
 
-          // 🔥 IPC 节流：强制降频到 ~30fps (33ms)，不让前端高刷卡死后端
           if (timestamp - lastIpcTime > 33 || fadeProgress >= 1) {
-              const logVol = Math.pow(actualVolume, 2) * 0.5;
+              const logVol = Math.pow(actualVolume, 2);
               invoke('player_set_volume', { vol: logVol }).catch(()=>{});
               lastIpcTime = timestamp;
           }
@@ -100,6 +93,26 @@ export const usePlayerStore = defineStore('player', () => {
       };
 
       fadeRafId = requestAnimationFrame(step);
+  };
+
+  // ⏱️ 5秒级原子同步闭环：以后端零阻塞原子时钟为标准，无缝对齐前端视觉
+  const startGlobalSyncTimer = () => {
+      if (syncTimerId) clearInterval(syncTimerId);
+      syncTimerId = setInterval(async () => {
+          // 加入 isBuffering 防护：避免切歌途中意外覆盖
+          if (isPlaying.value && !isPaused.value && !isSystemBusy.value && !isDragging.value && !isSeeking.value && !isBuffering.value) {
+              try {
+                  const backendTime = await invoke<number>('get_current_time');
+                  if (Math.abs(currentTime.value - backendTime) > 0.5) {
+                      // 同时修正歌词系统 (currentTime) 和进度条 UI (progress)
+                      currentTime.value = backendTime;
+                      if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
+                          progress.value = (backendTime / playlist.currentTrack.value.duration) * 100;
+                      }
+                  }
+              } catch (e) { }
+          }
+      }, 5000);
   };
 
   const syncEngine = async () => {
@@ -129,6 +142,10 @@ export const usePlayerStore = defineStore('player', () => {
   onMounted(async () => {
       await syncEngine();
       
+      invoke('init_persistence_layer').catch(() => {
+          notifyUI.value?.('Data recovery failed', 'info');
+      });
+
       await listen('ffmpeg-status', async (e: any) => {
           const status = e.payload;
           if (status === 'downloading') {
@@ -182,10 +199,42 @@ export const usePlayerStore = defineStore('player', () => {
 
       await listen('ffmpeg-progress', (e: any) => { engine.ffmpegProgress.value = e.payload as number; });
       await setupEventListeners();
+      startGlobalSyncTimer();
   });
 
+  const setOutputDevice = async (device: string): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
+      if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
+      
+      engine.lastMixerActionTime.value = Date.now();
+      isSystemBusy.value = true;
+      isBuffering.value = true;
+      notifyUI.value?.(`Hot-swapping: ${device}...`, 'info');
+
+      try {
+          await invoke('set_output_device', { device });
+          engine.activeDevice.value = device;
+          engine.hasAudioInitialized.value = true;
+          
+          if (playlist.currentTrack.value) {
+              try {
+                  const backendTime = await invoke<number>('get_current_time');
+                  currentTime.value = backendTime;
+              } catch (e) {}
+          }
+          notifyUI.value?.('Output Swapped');
+          return 'SUCCESS';
+      } catch (e) { 
+          notifyUI.value?.('Migration Failed', 'error');
+          return 'FAILED'; 
+      } finally {
+          isSystemBusy.value = false;
+          isBuffering.value = false;
+      }
+  };
+
   const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED' | 'COOLING'> => {
-      if (engine.isDownloadingFFmpeg.value || engine.isEngineSwitching.value || isSeeking.value || isBuffering.value || isDragging.value) {
+      if (isSystemBusy.value || engine.isDownloadingFFmpeg.value || engine.isEngineSwitching.value || isSeeking.value || isBuffering.value || isDragging.value) {
           notifyUI.value?.('System busy', 'error'); return 'FAILED';
       }
       
@@ -198,6 +247,8 @@ export const usePlayerStore = defineStore('player', () => {
       const previousEngine = engine.activeEngine.value;
       if (previousEngine === engineId) return 'SUCCESS';
       
+      isSystemBusy.value = true;
+      isBuffering.value = true;
       engine.isEngineSwitching.value = true;
       notifyUI.value?.(`Initializing ${engineId}...`);
       
@@ -243,12 +294,12 @@ export const usePlayerStore = defineStore('player', () => {
           await syncEngine();
           engine.isEngineSwitching.value = false; 
           return 'FAILED';
+      } finally {
+          isSystemBusy.value = false;
+          isBuffering.value = false;
       }
   };
 
-  // ==========================================
-  // 核心播放控制：完美抗压防死锁
-  // ==========================================
   const executePlayLogic = async (session: number, isNewTrack: boolean) => {
       try {
         if (isNewTrack && playlist.currentTrack.value) {
@@ -262,10 +313,8 @@ export const usePlayerStore = defineStore('player', () => {
             }
         }
 
-        // 校验：在调用底层前，是否已经被最新点击的 Pause 覆盖了？
         if (session !== playActionSession) return;
         await invoke('player_play').catch(()=>{});
-        // 再次校验以防后端 IO 阻塞导致的状态过期
         if (session !== playActionSession) return;
 
         isPlaying.value = true;
@@ -275,7 +324,6 @@ export const usePlayerStore = defineStore('player', () => {
         
         const targetVol = Math.max(0.001, volume.value / 100.0);
         
-        // 触发平滑过渡引擎：如果是从半路暂停回来，这里会完美基于 actualVolume 无缝攀升！
         smoothVolumeTransition(targetVol, 400, () => {
             if (session === playActionSession && engine.isSmtcEnabled.value) {
                 invoke('sync_smtc_status', { isPlaying: true }).catch(()=>{});
@@ -299,9 +347,7 @@ export const usePlayerStore = defineStore('player', () => {
               await invoke('player_pause').catch(()=>{});
               if (engine.isSmtcEnabled.value) invoke('sync_smtc_status', { isPlaying: false }).catch(()=>{});
           } else {
-              // 淡出到 0：这里降音量，底层仍在播放直到降到 0
               smoothVolumeTransition(0.0, 300, async () => {
-                  // 确保淡出完之后，用户没有中途又点了播放
                   if (session === playActionSession) {
                       await invoke('player_pause').catch(()=>{});
                       if (engine.isSmtcEnabled.value) invoke('sync_smtc_status', { isPlaying: false }).catch(()=>{});
@@ -312,7 +358,7 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const togglePlay = () => {
-    if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
+    if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
     if (!playlist.currentTrack.value) return;
     if (isTrackSwitching.value || isSeeking.value || isBuffering.value) return;
 
@@ -325,12 +371,10 @@ export const usePlayerStore = defineStore('player', () => {
     isPlaying.value = intentToPlay;
     isPaused.value = !intentToPlay; 
     
-    // 🔥 并发霸权锁：抢占令牌，使队列里还在等待的相反操作直接报废
     const session = ++playActionSession; 
 
     if (actionTimeoutId) clearTimeout(actionTimeoutId);
     
-    // 防抖时间 50ms：轻松化解 SMTC 的高频抽风连击
     actionTimeoutId = setTimeout(async () => {
         if (session !== playActionSession) return; 
         if (intentToPlay) await executePlayLogic(session, false);
@@ -370,7 +414,9 @@ export const usePlayerStore = defineStore('player', () => {
                 clearTimeout(bufferTimeout); 
 
                 if (mySession !== playSessionId.value || actionSession !== playActionSession) {
-                    isBuffering.value = false; resolve(); return;
+                    isBuffering.value = false;
+                    resolve();
+                    return;
                 }
                 
                 if (duration > 0.1) playlist.currentTrack.value!.duration = duration;
@@ -385,16 +431,18 @@ export const usePlayerStore = defineStore('player', () => {
                     isBuffering.value = false;
                     notifyUI.value?.("Play failed", "error");
                 }
+            } finally {
+                resolve();
             }
-            resolve();
         }, 50);
     });
   };
 
   const performTrackSwitch = async (updateIndexFn: () => void) => {
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
       if (isTrackSwitching.value) return;
       isTrackSwitching.value = true; 
+      isSystemBusy.value = true; 
       
       const isFirstPlay = !hasStarted.value;
       const delay = isFirstPlay ? 0 : 450;
@@ -408,11 +456,13 @@ export const usePlayerStore = defineStore('player', () => {
               updateIndexFn();
               await loadAndPlay();
               isTrackSwitching.value = false; 
+              isSystemBusy.value = false; 
           }, delay);
       } else {
           updateIndexFn();
           await loadAndPlay();
           isTrackSwitching.value = false; 
+          isSystemBusy.value = false; 
       }
   };
 
@@ -443,69 +493,73 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const playTrack = async (track: Track) => { 
-      const idx = playlist.queue.value.indexOf(track); 
+      const idx = playlist.queue.value.findIndex(t => t.id === track.id);
       if (idx !== -1) await performTrackSwitch(() => { playlist.currentIndex.value = idx; }); 
   };
 
-  const setOutputDevice = async (device: string): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
-      if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
-      engine.lastMixerActionTime.value = Date.now();
-
-      try {
-          await invoke('set_output_device', { device });
-          engine.activeDevice.value = device;
-          engine.hasAudioInitialized.value = true;
-          
-          if (playlist.currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
-              await invoke('player_seek', { time: currentTime.value });
-          }
-      } catch (e) { 
-          notifyUI.value?.('Device error', 'error'); return 'FAILED'; 
-      }
-      return 'SUCCESS';
-  };
-
   const setChannelMode = async (mode: number): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
       if (mode === 2) engine.isTrueSurround.value = false;
       else if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
+      
       engine.lastMixerActionTime.value = Date.now();
 
       if (engine.channelMode.value === mode) return 'SUCCESS';
-      engine.channelMode.value = mode;
-      localStorage.setItem('channel_mode', mode.toString());
-      localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
-
-      const finalMode = (engine.isTrueSurround.value && mode > 2) ? mode + 100 : mode;
-      await invoke('player_set_channels', { mode: finalMode });
       
-      if (playlist.currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
-          await invoke('player_seek', { time: currentTime.value });
+      isSystemBusy.value = true;
+      isBuffering.value = true;
+
+      try {
+          engine.channelMode.value = mode;
+          localStorage.setItem('channel_mode', mode.toString());
+          localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
+
+          const finalMode = (engine.isTrueSurround.value && mode > 2) ? mode + 100 : mode;
+          await invoke('player_set_channels', { mode: finalMode });
+          
+          if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
+              await invoke('player_seek', { time: currentTime.value });
+          }
+          return 'SUCCESS';
+      } catch (e) {
+          return 'FAILED';
+      } finally {
+          isSystemBusy.value = false;
+          isBuffering.value = false;
       }
-      return 'SUCCESS';
   };
 
   const toggleTrueSurround = async (): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
       if (engine.channelMode.value === 2) return 'FAILED';
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return 'FAILED';
       if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
+      
       engine.lastMixerActionTime.value = Date.now();
 
-      engine.isTrueSurround.value = !engine.isTrueSurround.value;
-      localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
+      isSystemBusy.value = true;
+      isBuffering.value = true;
 
-      const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
-      await invoke('player_set_channels', { mode: finalMode });
-      
-      if (playlist.currentTrack.value && !isTrackSwitching.value && !isBuffering.value && !isSeeking.value) {
-          await invoke('player_seek', { time: currentTime.value });
+      try {
+          engine.isTrueSurround.value = !engine.isTrueSurround.value;
+          localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
+
+          const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
+          await invoke('player_set_channels', { mode: finalMode });
+          
+          if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
+              await invoke('player_seek', { time: currentTime.value });
+          }
+          return 'SUCCESS';
+      } catch (e) {
+          return 'FAILED';
+      } finally {
+          isSystemBusy.value = false;
+          isBuffering.value = false;
       }
-      return 'SUCCESS';
   };
 
   const setVolume = (v: number) => {
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
       volume.value = v;
       if (v > 0) {
           lastActiveVolume.value = v;
@@ -514,7 +568,7 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const toggleMute = () => {
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
       if (volume.value > 0) {
           lastActiveVolume.value = volume.value;
           localStorage.setItem('last_active_vol', volume.value.toString());
@@ -525,19 +579,18 @@ export const usePlayerStore = defineStore('player', () => {
   };
 
   const seekTo = async (percent: number) => {
-    if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
+    if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value) return; 
     if (!playlist.currentTrack.value || playlist.currentTrack.value.duration <= 0) return;
     if (isTrackSwitching.value || isSeeking.value) return; 
 
     const wasPlaying = isPlaying.value && !isPaused.value;
     isSeeking.value = true; 
+    isSystemBusy.value = true;
     const actionSession = ++playActionSession; 
     
     if (wasPlaying) {
         isPlaying.value = false;
         isPaused.value = true;
-        stopProgressLoop();
-        
         await new Promise<void>(resolve => {
             smoothVolumeTransition(0.0, 150, async () => {
                 if (actionSession === playActionSession) {
@@ -546,27 +599,29 @@ export const usePlayerStore = defineStore('player', () => {
                 resolve();
             });
         });
-    } else {
-        stopProgressLoop();
-        isPlaying.value = false;
-        isPaused.value = true;
-    }
+    } 
     
     if (actionSession !== playActionSession) {
-        isSeeking.value = false; return;
+        isSeeking.value = false; 
+        isSystemBusy.value = false;
+        return;
     }
 
     const targetTime = (percent / 100) * playlist.currentTrack.value.duration;
     progress.value = percent; 
     currentTime.value = targetTime;
     
-    try { await invoke('player_seek', { time: targetTime }); } catch (e) {}
-
-    isSeeking.value = false; 
-    if (wasPlaying && actionSession === playActionSession) {
-        isPlaying.value = true;
-        isPaused.value = false;
-        await executePlayLogic(actionSession, false);
+    try { 
+        await invoke('player_seek', { time: targetTime }); 
+    } catch (e) {
+    } finally {
+        isSeeking.value = false; 
+        isSystemBusy.value = false;
+        if (wasPlaying && actionSession === playActionSession) {
+            isPlaying.value = true;
+            isPaused.value = false;
+            await executePlayLogic(actionSession, false);
+        }
     }
   };
 
@@ -602,8 +657,17 @@ export const usePlayerStore = defineStore('player', () => {
     await listen('import-cancel', () => { isImporting.value = false; });
     
     await listen<number>('seek-end', (e) => {
-        if (isSeeking.value || isDragging.value || isBuffering.value) return; 
-        if (Math.abs(currentTime.value - e.payload) > 0.5) currentTime.value = e.payload;
+        if (isSystemBusy.value || isSeeking.value || isDragging.value || isBuffering.value) return; 
+        if (Math.abs(currentTime.value - e.payload) > 1.0) {
+            currentTime.value = e.payload;
+            if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
+                progress.value = (e.payload / playlist.currentTrack.value.duration) * 100;
+            }
+        }
+    });
+
+    await listen('force-pause', () => { 
+        isPlaying.value = false; isPaused.value = true; stopProgressLoop();
     });
   };
 
@@ -631,20 +695,23 @@ export const usePlayerStore = defineStore('player', () => {
     lastFrameTime = performance.now();
     
     const loop = (timestamp: number) => {
-      if (!isPlaying.value || isPaused.value || !playlist.currentTrack.value) return; 
+      if (!isPlaying.value || isPaused.value) return; 
       
       const deltaTime = (timestamp - lastFrameTime) / 1000; 
       lastFrameTime = timestamp;
       
-      if (!isDragging.value && !isBuffering.value && !isSeeking.value) {
+      if (!isDragging.value && !isBuffering.value && !isSeeking.value && !isSystemBusy.value && playlist.currentTrack.value) {
           currentTime.value += deltaTime;
           if (currentTime.value >= playlist.currentTrack.value.duration) {
              if (playlist.playMode.value === 'loop') { 
                  currentTime.value = 0; invoke('player_seek', { time: 0.0 }); 
              } else { nextTrack(); return; }
           }
-          if (playlist.currentTrack.value.duration > 0) progress.value = (currentTime.value / playlist.currentTrack.value.duration) * 100;
+          if (playlist.currentTrack.value.duration > 0) {
+              progress.value = (currentTime.value / playlist.currentTrack.value.duration) * 100;
+          }
       }
+      
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
@@ -654,24 +721,17 @@ export const usePlayerStore = defineStore('player', () => {
       if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } 
   };
 
-  // 🔥 监听UI音量条：完美的无缝接入
   watch(volume, (v) => { 
-      if (engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
+      if (isSystemBusy.value || engine.isEngineSwitching.value || engine.isDownloadingFFmpeg.value || isBuffering.value || isSeeking.value) return;
 
       const target = v / 100.0;
       
-      // 只有真正在发声的时候，才去触发底层的音量修改
       if (isPlaying.value && !isPaused.value) {
           if (fadeRafId !== null) {
-              // 【无缝衔接】：正在淡入淡出中被打断修改音量
-              // 直接以当前 actualVolume 为起点，平滑过渡到新值！
               smoothVolumeTransition(target, 150);
           } else {
-              // 【非淡入淡出状态】：直接修改，瞬发响应
               setBackendVolume(target);
           }
-      } else {
-          // 如果处于完全暂停状态，不发IPC，等待下一次 Play 动作自动平滑推向新音量
       }
   });
 
@@ -703,7 +763,7 @@ export const usePlayerStore = defineStore('player', () => {
     ...playlist,
     ...engine,
     isPlaying, isPaused, hasStarted, volume, progress, currentTime, 
-    isDragging, isBuffering, isSeeking, playSessionId, isTrackSwitching, 
+    isDragging, isBuffering, isSeeking, isSystemBusy, playSessionId, isTrackSwitching, 
     isImporting, importCount, importTotal, importProgress, lastActiveVolume, showCredits, 
 
     setNotifier, setVolume, toggleMute, togglePlay, nextTrack, prevTrack, 

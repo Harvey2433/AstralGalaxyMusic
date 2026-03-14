@@ -7,8 +7,8 @@ use std::fs;
 use tokio::time::timeout;
 use std::env;
 use std::io::{Cursor, Read, BufReader, BufRead}; 
-use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU32, Ordering}; 
+use std::sync::{Arc, Mutex, RwLock, OnceLock};
+use std::sync::atomic::{AtomicUsize, AtomicBool, AtomicU32, AtomicU64, Ordering}; 
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{Window, Emitter, Manager}; 
@@ -20,6 +20,19 @@ use rodio::cpal::traits::{HostTrait, DeviceTrait};
 use std::os::windows::process::CommandExt;
 
 use super::galaxy::{UpmixSource, ChannelConfig};
+
+// =================================================================
+// ⏱️ 全局高精度原子时钟基准 (Lock-Free Epoch)
+// =================================================================
+static TIME_EPOCH: OnceLock<Instant> = OnceLock::new();
+#[inline(always)]
+fn get_time_epoch() -> Instant {
+    *TIME_EPOCH.get_or_init(Instant::now)
+}
+#[inline(always)]
+fn f64_to_bits(f: f64) -> u64 { f.to_bits() }
+#[inline(always)]
+fn f64_from_bits(b: u64) -> f64 { f64::from_bits(b) }
 
 fn get_dynamic_target_sr() -> u32 {
     if let Some(device) = rodio::cpal::default_host().default_output_device() {
@@ -36,8 +49,8 @@ pub struct FFmpegEngine {
     current_samples: Option<Arc<Vec<f32>>>, 
     sample_rate: u32,
     current_volume: Arc<AtomicU32>, 
-    playback_pos: Arc<RwLock<f64>>,
-    last_play_instant: Arc<RwLock<Option<Instant>>>,
+    playback_pos: Arc<AtomicU64>,
+    last_play_us: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     channel_mode: Arc<RwLock<ChannelConfig>>,
     fade_token: Arc<AtomicUsize>,
@@ -52,20 +65,12 @@ impl FFmpegEngine {
             current_samples: None,
             sample_rate: 48000, 
             current_volume: Arc::new(AtomicU32::new(1f32.to_bits())), 
-            playback_pos: Arc::new(RwLock::new(0.0)),
-            last_play_instant: Arc::new(RwLock::new(None)),
+            playback_pos: Arc::new(AtomicU64::new(f64_to_bits(0.0))),
+            last_play_us: Arc::new(AtomicU64::new(u64::MAX)),
             is_playing: Arc::new(AtomicBool::new(false)),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
             fade_token: Arc::new(AtomicUsize::new(0)),
         } 
-    }
-
-    pub fn get_current_time(&self) -> f64 {
-        let mut pos = *self.playback_pos.read().unwrap();
-        if let Some(inst) = *self.last_play_instant.read().unwrap() {
-            pos += inst.elapsed().as_secs_f64();
-        }
-        pos
     }
 
     fn get_ffmpeg_dir() -> PathBuf {
@@ -135,11 +140,35 @@ impl FFmpegEngine {
 impl AudioEngine for FFmpegEngine {
     fn name(&self) -> &str { "FFmpeg soxr-VHQ (Mastering Grade)" }
 
+    fn get_current_time(&self) -> f64 {
+        let pos = f64_from_bits(self.playback_pos.load(Ordering::Relaxed));
+        let start_us = self.last_play_us.load(Ordering::Relaxed);
+        if start_us != u64::MAX {
+            let epoch = get_time_epoch();
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            let elapsed = now_us.saturating_sub(start_us) as f64 / 1_000_000.0;
+            pos + elapsed
+        } else {
+            pos
+        }
+    }
+
     fn update_output_stream(&mut self, handle: OutputStreamHandle) {
-        if self.is_playing.load(Ordering::SeqCst) { self.is_playing.store(false, Ordering::SeqCst); thread::sleep(Duration::from_millis(40)); }
-        let current_time = self.get_current_time();
+        let was_playing = self.is_playing.load(Ordering::SeqCst);
+        let current_time = (self.get_current_time() - 0.4).max(0.0);
+
+        if was_playing { 
+            self.is_playing.store(false, Ordering::SeqCst); 
+            if let Ok(s) = self.sink.lock() { s.pause(); }
+            thread::sleep(Duration::from_millis(50)); 
+        }
+        
         self.stream_handle = handle.clone();
         self.seek(current_time);
+        
+        if was_playing { 
+            self.play(); 
+        }
     }
 
     fn load(&mut self, path: &str) -> Result<f64, String> {
@@ -148,11 +177,9 @@ impl AudioEngine for FFmpegEngine {
         let ffmpeg_exe = Self::get_ffmpeg_exe();
         let target_sr = get_dynamic_target_sr();
         
+        println!("\x1b[36m[FFMPEG] Audio Engine Decoder Initialized: Target SR = {}Hz, Channels = 2\x1b[0m", target_sr);
+        
         let mut cmd = Command::new(&ffmpeg_exe);
-        // 🔥 终极修正：对齐 Galaxy 引擎的音量策略
-        // 1. 移除多余增益。
-        // 2. 将 alimiter 阈值推到 0.99，仅做防爆，不做压缩。
-        // 3. 启用最顶级的 soxr 重采样参数。
         cmd.args(&[
             "-i", path, "-f", "f32le", "-ac", "2", "-ar", &target_sr.to_string(), 
             "-af", "aresample=resampler=soxr:precision=28:cheby=1:dither_method=triangular,alimiter=limit=0.99:attack=1:release=20:asc=0",
@@ -189,8 +216,16 @@ impl AudioEngine for FFmpegEngine {
         let samples_arc = Arc::new(samples);
         self.current_samples = Some(samples_arc.clone());
         self.sample_rate = target_sr;
-        *self.playback_pos.write().unwrap() = 0.0;
-        *self.last_play_instant.write().unwrap() = if self.is_playing.load(Ordering::SeqCst) { Some(Instant::now()) } else { None };
+        
+        self.playback_pos.store(f64_to_bits(0.0), Ordering::SeqCst);
+        let epoch = get_time_epoch();
+        if self.is_playing.load(Ordering::SeqCst) {
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            self.last_play_us.store(now_us, Ordering::SeqCst);
+        } else {
+            self.last_play_us.store(u64::MAX, Ordering::SeqCst);
+        }
+        
         self.fade_token.fetch_add(1, Ordering::SeqCst);
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
@@ -208,15 +243,33 @@ impl AudioEngine for FFmpegEngine {
 
     fn play(&mut self) {
         if self.is_playing.swap(true, Ordering::SeqCst) { return; }
-        *self.last_play_instant.write().unwrap() = Some(Instant::now());
+        
+        let epoch = get_time_epoch();
+        let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+        self.last_play_us.store(now_us, Ordering::SeqCst);
+        
         if let Ok(s) = self.sink.lock() { s.play(); } 
     }
 
     fn pause(&mut self) {
         if !self.is_playing.swap(false, Ordering::SeqCst) { return; }
-        if let Some(i) = self.last_play_instant.write().unwrap().take() {
-            *self.playback_pos.write().unwrap() += i.elapsed().as_secs_f64();
+        
+        let start_us = self.last_play_us.swap(u64::MAX, Ordering::SeqCst);
+        if start_us != u64::MAX {
+            let epoch = get_time_epoch();
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            let elapsed = now_us.saturating_sub(start_us) as f64 / 1_000_000.0;
+            
+            let mut current = self.playback_pos.load(Ordering::Relaxed);
+            loop {
+                let new_val = f64_from_bits(current) + elapsed;
+                match self.playback_pos.compare_exchange_weak(current, f64_to_bits(new_val), Ordering::SeqCst, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => current = x,
+                }
+            }
         }
+        
         let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
         let token_ref = self.fade_token.clone();
         let sink_clone = self.sink.clone();
@@ -232,8 +285,16 @@ impl AudioEngine for FFmpegEngine {
     fn seek(&mut self, time: f64) {
         let is_playing_now = self.is_playing.load(Ordering::SeqCst);
         if is_playing_now { self.is_playing.store(false, Ordering::SeqCst); thread::sleep(Duration::from_millis(40)); }
-        *self.playback_pos.write().unwrap() = time;
-        *self.last_play_instant.write().unwrap() = if is_playing_now { Some(Instant::now()) } else { None };
+        
+        self.playback_pos.store(f64_to_bits(time), Ordering::SeqCst);
+        let epoch = get_time_epoch();
+        if is_playing_now {
+            let now_us = Instant::now().duration_since(epoch).as_micros() as u64;
+            self.last_play_us.store(now_us, Ordering::SeqCst);
+        } else {
+            self.last_play_us.store(u64::MAX, Ordering::SeqCst);
+        }
+        
         {
             let mut sink_guard = self.sink.lock().unwrap();
             *sink_guard = Sink::try_new(&self.stream_handle).unwrap();

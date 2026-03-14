@@ -22,9 +22,10 @@ pub trait AudioEngine: Send + Sync {
     fn name(&self) -> &str;
     fn set_channel_mode(&mut self, _mode: u16) {}
     fn update_output_stream(&mut self, _handle: OutputStreamHandle) {} 
+    fn get_current_time(&self) -> f64; // 对齐物理时间戳接口
 }
 
-// 🔥 核心重构：定义所有的异步指令小纸条
+// 定义所有的异步指令小纸条
 pub enum AudioCommand {
     Load(String, oneshot::Sender<Result<f64, String>>),
     Play,
@@ -37,6 +38,7 @@ pub enum AudioCommand {
     SwitchEngine(String, oneshot::Sender<Result<String, String>>),
     GetCurrentEngine(oneshot::Sender<String>),
     CheckDeviceStatus(oneshot::Sender<Option<String>>),
+    GetCurrentTime(oneshot::Sender<f64>),
 }
 
 pub struct AudioManager {
@@ -48,14 +50,12 @@ pub struct AudioManager {
 }
 
 impl AudioManager {
-    // 🔥 核心重构：无锁消息循环，彻底切断与 Tauri 线程的物理纠缠！
     pub fn start_actor() -> Sender<AudioCommand> {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
         
         std::thread::spawn(move || {
             let mut manager = AudioManager::new();
             
-            // 永动监听循环：只负责接指令干活，就算卡死也只卡自己，前端照样 144Hz 丝滑运行
             while let Ok(cmd) = rx.recv() {
                 match cmd {
                     AudioCommand::Load(path, reply) => { let _ = reply.send(manager.load(&path)); }
@@ -69,6 +69,7 @@ impl AudioManager {
                     AudioCommand::SwitchEngine(engine_id, reply) => { let _ = reply.send(manager.switch_engine(&engine_id)); }
                     AudioCommand::GetCurrentEngine(reply) => { let _ = reply.send(manager.active_engine.name().to_string()); }
                     AudioCommand::CheckDeviceStatus(reply) => { let _ = reply.send(manager.check_device_status()); }
+                    AudioCommand::GetCurrentTime(reply) => { let _ = reply.send(manager.active_engine.get_current_time()); }
                 }
             }
         });
@@ -93,8 +94,6 @@ impl AudioManager {
             last_resolved_default: default_name,
         }
     }
-
-    // ========== 下方底层业务逻辑保留了 100% 原始代码，没有任何妥协和缩水！ ==========
 
     pub fn check_device_status(&mut self) -> Option<String> {
         let host = rodio::cpal::default_host();

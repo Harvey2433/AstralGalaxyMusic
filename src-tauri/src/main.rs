@@ -12,6 +12,9 @@ use tauri::{Manager, Emitter, Listener};
 use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use base64::{Engine as _, engine::general_purpose};
+use serde::{Serialize, Deserialize};
+use std::fs;
+use std::path::PathBuf;
 
 struct SmtcHandle {
     controls: Mutex<Option<MediaControls>>,
@@ -21,6 +24,71 @@ struct SmtcHandle {
 fn log_smtc(msg: &str) {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     println!("[{}] {}", timestamp, msg);
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UserSettings {
+    pub volume: f32,
+    pub channel_mode: u16,
+    pub engine_id: String,
+    pub output_device: String,
+    pub has_completed_guide: bool,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            volume: 0.8,
+            channel_mode: 2,
+            engine_id: "galaxy".into(),
+            output_device: "Default".into(),
+            has_completed_guide: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PersistentData {
+    pub settings: UserSettings,
+    pub favorite_tracks: Vec<String>,
+}
+
+#[tauri::command]
+async fn init_persistence_layer(app: tauri::AppHandle) -> Result<bool, String> {
+    let config_dir = app.path().app_config_dir().unwrap_or_else(|_| PathBuf::from("./config"));
+    if !config_dir.exists() {
+        let _ = fs::create_dir_all(&config_dir);
+    }
+    
+    let data_path = config_dir.join("astral_data.json");
+    if !data_path.exists() {
+        println!("[CORE] Data file missing. Triggering first-run guide.");
+        return Ok(false); 
+    }
+
+    match fs::read_to_string(&data_path) {
+        Ok(json) => {
+            if let Ok(_data) = serde_json::from_str::<PersistentData>(&json) {
+                Ok(true) 
+            } else {
+                let _ = app.emit("island-notify", ("Configuration Parse Error", "error"));
+                Ok(true)
+            }
+        },
+        Err(_) => {
+            let _ = app.emit("island-notify", ("Storage Read Access Denied", "error"));
+            Ok(true) 
+        }
+    }
+}
+
+#[tauri::command]
+async fn save_astral_data(app: tauri::AppHandle, data: PersistentData) -> Result<(), String> {
+    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    let data_path = config_dir.join("astral_data.json");
+    let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
+    fs::write(data_path, json).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -232,9 +300,9 @@ fn main() {
             import_music, check_file_exists, init_audio_engine, 
             player_load_track, player_play, player_pause, player_seek, player_set_volume,
             player_set_channels, get_output_devices, set_output_device,
-            get_lyrics, get_current_engine,
+            get_lyrics, get_current_engine, get_current_time,
             sync_smtc_metadata, sync_smtc_status,
-            toggle_smtc_active
+            toggle_smtc_active, init_persistence_layer, save_astral_data
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
