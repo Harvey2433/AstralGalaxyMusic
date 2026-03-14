@@ -420,6 +420,7 @@ export const usePlayerStore = defineStore('player', () => {
               });
           }
       } catch (e) { console.error(e); }
+      
   };
 
   const togglePlay = () => {
