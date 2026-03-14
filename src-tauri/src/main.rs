@@ -8,13 +8,46 @@ use audio::AudioManager;
 use modules::state::AppState;
 use modules::commands::*; 
 
-use tauri::{Manager, Emitter, Listener}; 
+use tauri::{Manager, Emitter, Listener, WindowEvent}; 
 use souvlaki::{MediaControlEvent, MediaControls, MediaPlayback, PlatformConfig};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use base64::{Engine as _, engine::general_purpose};
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::PathBuf;
+
+// ==========================================
+// 📦 后端持久化数据模型
+// ==========================================
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AstralSettings {
+    pub volume: f32,
+    pub engine_id: String,
+    pub channel_mode: u16,
+    pub is_true_surround: bool,
+    pub output_device: String,
+}
+
+impl Default for AstralSettings {
+    fn default() -> Self {
+        Self {
+            volume: 80.0,
+            engine_id: "galaxy".into(),
+            channel_mode: 2,
+            is_true_surround: false,
+            output_device: "Default".into(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AstralData {
+    pub settings: AstralSettings,
+    pub liked_tracks: serde_json::Value, 
+}
+
+// 🔥 后端实时持久化快照：存储于静态内存，确保退出信号触发时无需等待 IPC 直接落盘
+static PERSISTENCE_SNAPSHOT: Mutex<Option<AstralData>> = Mutex::new(None);
 
 struct SmtcHandle {
     controls: Mutex<Option<MediaControls>>,
@@ -26,71 +59,60 @@ fn log_smtc(msg: &str) {
     println!("[{}] {}", timestamp, msg);
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct UserSettings {
-    pub volume: f32,
-    pub channel_mode: u16,
-    pub engine_id: String,
-    pub output_device: String,
-    pub has_completed_guide: bool,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            volume: 0.8,
-            channel_mode: 2,
-            engine_id: "galaxy".into(),
-            output_device: "Default".into(),
-            has_completed_guide: false,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PersistentData {
-    pub settings: UserSettings,
-    pub favorite_tracks: Vec<String>,
-}
-
+// ==========================================
+// 🛡️ 后端持久化指令集
+// ==========================================
 #[tauri::command]
-async fn init_persistence_layer(app: tauri::AppHandle) -> Result<bool, String> {
+async fn init_persistence_layer(app: tauri::AppHandle) -> Result<String, String> {
     let config_dir = app.path().app_config_dir().unwrap_or_else(|_| PathBuf::from("./config"));
-    if !config_dir.exists() {
-        let _ = fs::create_dir_all(&config_dir);
-    }
-    
+    if !config_dir.exists() { let _ = fs::create_dir_all(&config_dir); }
     let data_path = config_dir.join("astral_data.json");
-    if !data_path.exists() {
-        println!("[CORE] Data file missing. Triggering first-run guide.");
-        return Ok(false); 
-    }
-
+    if !data_path.exists() { return Ok("NO_FILE".into()); }
     match fs::read_to_string(&data_path) {
         Ok(json) => {
-            if let Ok(_data) = serde_json::from_str::<PersistentData>(&json) {
-                Ok(true) 
-            } else {
-                let _ = app.emit("island-notify", ("Configuration Parse Error", "error"));
-                Ok(true)
-            }
+            if serde_json::from_str::<AstralData>(&json).is_ok() { Ok("SUCCESS".into()) } 
+            else { Ok("CORRUPT".into()) }
         },
-        Err(_) => {
-            let _ = app.emit("island-notify", ("Storage Read Access Denied", "error"));
-            Ok(true) 
-        }
+        Err(_) => Ok("CORRUPT".into()) 
     }
 }
 
 #[tauri::command]
-async fn save_astral_data(app: tauri::AppHandle, data: PersistentData) -> Result<(), String> {
+async fn load_astral_data(app: tauri::AppHandle) -> Result<AstralData, String> {
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let data_path = config_dir.join("astral_data.json");
-    let json = serde_json::to_string_pretty(&data).map_err(|e| e.to_string())?;
-    fs::write(data_path, json).map_err(|e| e.to_string())?;
-    Ok(())
+    if data_path.exists() {
+        let json = fs::read_to_string(&data_path).map_err(|e| e.to_string())?;
+        let data: AstralData = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        Ok(data)
+    } else {
+        Ok(AstralData { settings: AstralSettings::default(), liked_tracks: serde_json::json!([]) })
+    }
 }
 
+#[tauri::command]
+fn update_persistence_snapshot(data: AstralData) {
+    let mut snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap();
+    *snapshot = Some(data);
+}
+
+fn perform_final_save(app: &tauri::AppHandle) {
+    let snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap();
+    if let Some(data) = snapshot.as_ref() {
+        if let Ok(config_dir) = app.path().app_config_dir() {
+            let _ = fs::create_dir_all(&config_dir);
+            let data_path = config_dir.join("astral_data.json");
+            if let Ok(json) = serde_json::to_string_pretty(data) {
+                let _ = fs::write(data_path, json);
+                println!("[BACKEND] Critical persistence snapshot committed successfully.");
+            }
+        }
+    }
+}
+
+// ==========================================
+// 🎨 Native Windows SMTC 同步核心
+// ==========================================
 #[cfg(target_os = "windows")]
 fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image_path: Option<String>) -> windows::core::Result<()> {
     use windows::Win32::Foundation::HWND;
@@ -123,7 +145,7 @@ fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image
             if let Ok(file) = StorageFile::GetFileFromPathAsync(&h_path)?.get() {
                 let stream_ref = RandomAccessStreamReference::CreateFromFile(&file)?;
                 updater.SetThumbnail(&stream_ref)?;
-                log_smtc(&format!("[NATIVE] Thumbnail set: {}", path_str));
+                log_smtc(&format!("[NATIVE] SMTC Thumbnail context bound: {}", path_str));
             }
         }
     }
@@ -245,6 +267,9 @@ async fn sync_smtc_status(handle: tauri::State<'_, SmtcHandle>, is_playing: bool
     Ok(())
 }
 
+// ==========================================
+// 🚀 系统主进程入口
+// ==========================================
 fn main() {
     log_smtc(">>> Astral Galaxy Music Player Backend Started <<<");
     
@@ -255,6 +280,13 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState { audio_tx })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                // 🔥 物理级强制保存：从静态内存快照中瞬间提取并同步写入硬盘
+                perform_final_save(window.app_handle());
+                println!("[CORE] Final snapshot sync completed. Exiting.");
+            }
+        })
         .setup(move |app| {
             let main_window = app.get_webview_window("main").unwrap();
             let app_handle = app.handle().clone();
@@ -271,6 +303,7 @@ fn main() {
                 println!("[NATIVE] Window securely shown and focused.");
             });
 
+            // 🛠️ 硬件拓扑守护线程：实时监控声卡设备变动
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -302,7 +335,8 @@ fn main() {
             player_set_channels, get_output_devices, set_output_device,
             get_lyrics, get_current_engine, get_current_time,
             sync_smtc_metadata, sync_smtc_status,
-            toggle_smtc_active, init_persistence_layer, save_astral_data
+            toggle_smtc_active, init_persistence_layer, load_astral_data,
+            update_persistence_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

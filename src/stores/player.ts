@@ -27,11 +27,23 @@ export const usePlayerStore = defineStore('player', () => {
   const isTrackSwitching = ref(false);
 
   const isSystemBusy = ref(false);
+  const needsInitialization = ref(false); 
 
   const isImporting = ref(false);
   const importCount = ref(0);
   const importTotal = ref(0);
   const importProgress = ref(0);
+
+  // ❤️ 我喜欢列表核心逻辑
+  const likedQueue = ref<Track[]>([]);
+  const toggleLike = (track: Track) => {
+      const idx = likedQueue.value.findIndex(t => t.id === track.id);
+      if (idx === -1) likedQueue.value.push(track);
+      else likedQueue.value.splice(idx, 1);
+  };
+  const isLiked = (track: Track) => {
+      return likedQueue.value.some(t => t.id === track.id);
+  };
 
   let actionTimeoutId: any = null;
   let coolingTimerId: any = null;
@@ -46,9 +58,30 @@ export const usePlayerStore = defineStore('player', () => {
   let lastIpcTime = 0;        
   let playActionSession = 0;  
 
+  // 🔥 实时持久化快照同步：将最新 UI 状态实时推送到后端内存，由后端在退出时执行物理落盘
+  watch(
+    () => [volume.value, engine.activeEngine.value, engine.channelMode.value, engine.isTrueSurround.value, engine.activeDevice.value, likedQueue.value],
+    () => {
+        invoke('update_persistence_snapshot', {
+            data: {
+                settings: {
+                    volume: volume.value,
+                    engine_id: engine.activeEngine.value,
+                    channel_mode: engine.channelMode.value,
+                    is_true_surround: engine.isTrueSurround.value,
+                    output_device: engine.activeDevice.value
+                },
+                liked_tracks: likedQueue.value
+            }
+        }).catch(()=>{});
+    },
+    { deep: true }
+  );
+
   const setBackendVolume = (v: number) => {
       if (isSystemBusy.value) return; 
       actualVolume = Math.max(0, Math.min(1, v));
+      // 物理级音量曲线修正：采用二次方映射以符合人耳听感，并由后端原子时钟调度
       const logVol = Math.pow(actualVolume, 2); 
       invoke('player_set_volume', { vol: logVol }).catch(()=>{});
       lastIpcTime = performance.now();
@@ -78,6 +111,7 @@ export const usePlayerStore = defineStore('player', () => {
 
           actualVolume = startVol + diff * fadeProgress;
 
+          // 节流处理：确保 IPC 管道每秒最高 30 次更新，防止 UI 线程阻塞
           if (timestamp - lastIpcTime > 33 || fadeProgress >= 1) {
               const logVol = Math.pow(actualVolume, 2);
               invoke('player_set_volume', { vol: logVol }).catch(()=>{});
@@ -95,16 +129,14 @@ export const usePlayerStore = defineStore('player', () => {
       fadeRafId = requestAnimationFrame(step);
   };
 
-  // ⏱️ 5秒级原子同步闭环：以后端零阻塞原子时钟为标准，无缝对齐前端视觉
+  // ⏱️ 5秒级原子同步闭环：以后端零阻塞原子时钟为标准，无缝对齐前端视觉与歌词序列
   const startGlobalSyncTimer = () => {
       if (syncTimerId) clearInterval(syncTimerId);
       syncTimerId = setInterval(async () => {
-          // 加入 isBuffering 防护：避免切歌途中意外覆盖
           if (isPlaying.value && !isPaused.value && !isSystemBusy.value && !isDragging.value && !isSeeking.value && !isBuffering.value) {
               try {
                   const backendTime = await invoke<number>('get_current_time');
                   if (Math.abs(currentTime.value - backendTime) > 0.5) {
-                      // 同时修正歌词系统 (currentTime) 和进度条 UI (progress)
                       currentTime.value = backendTime;
                       if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
                           progress.value = (backendTime / playlist.currentTrack.value.duration) * 100;
@@ -142,9 +174,36 @@ export const usePlayerStore = defineStore('player', () => {
   onMounted(async () => {
       await syncEngine();
       
-      invoke('init_persistence_layer').catch(() => {
-          notifyUI.value?.('Data recovery failed', 'info');
-      });
+      try {
+          const status = await invoke<string>('init_persistence_layer');
+          if (status === 'CORRUPT' || status === 'NO_FILE') {
+              if (status === 'CORRUPT') notifyUI.value?.('配置文件已损坏，重置为默认', 'error');
+              needsInitialization.value = true;
+          } else if (status === 'SUCCESS') {
+              const data = await invoke<any>('load_astral_data');
+              if (data && data.settings) {
+                  volume.value = data.settings.volume;
+                  lastActiveVolume.value = volume.value;
+                  engine.activeEngine.value = data.settings.engine_id;
+                  engine.activeDevice.value = data.settings.output_device;
+                  engine.channelMode.value = data.settings.channel_mode;
+                  engine.isTrueSurround.value = data.settings.is_true_surround;
+                  likedQueue.value = data.liked_tracks || [];
+
+                  // 给后端的初始音量：自动应用二次方映射
+                  invoke('player_set_volume', { vol: Math.pow(volume.value / 100.0, 2) }).catch(()=>{});
+                  
+                  const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
+                  invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
+                  
+                  if (engine.activeEngine.value !== 'galaxy') {
+                      invoke('init_audio_engine', { engineId: engine.activeEngine.value }).catch(()=>{});
+                  }
+              }
+          }
+      } catch(e) {
+          needsInitialization.value = true;
+      }
 
       await listen('ffmpeg-status', async (e: any) => {
           const status = e.payload;
@@ -212,9 +271,13 @@ export const usePlayerStore = defineStore('player', () => {
       notifyUI.value?.(`Hot-swapping: ${device}...`, 'info');
 
       try {
-          await invoke('set_output_device', { device });
-          engine.activeDevice.value = device;
-          engine.hasAudioInitialized.value = true;
+        if (!hasStarted.value) {
+            engine.activeDevice.value = device;
+            return 'SUCCESS';
+          }
+        await invoke('set_output_device', { device });
+        engine.activeDevice.value = device;
+        engine.hasAudioInitialized.value = true;
           
           if (playlist.currentTrack.value) {
               try {
@@ -322,6 +385,7 @@ export const usePlayerStore = defineStore('player', () => {
         if (!hasStarted.value) hasStarted.value = true;
         startProgressLoop(); 
         
+        // 软启动逻辑：400ms 内平滑淡入到用户设定的音量，防止爆音
         const targetVol = Math.max(0.001, volume.value / 100.0);
         
         smoothVolumeTransition(targetVol, 400, () => {
@@ -347,6 +411,7 @@ export const usePlayerStore = defineStore('player', () => {
               await invoke('player_pause').catch(()=>{});
               if (engine.isSmtcEnabled.value) invoke('sync_smtc_status', { isPlaying: false }).catch(()=>{});
           } else {
+              // 软停止逻辑：300ms 内淡出，确保听觉过渡自然
               smoothVolumeTransition(0.0, 300, async () => {
                   if (session === playActionSession) {
                       await invoke('player_pause').catch(()=>{});
@@ -492,9 +557,14 @@ export const usePlayerStore = defineStore('player', () => {
       });
   };
 
+  // 🔥 强力播放器逻辑：支持跨列表点火播放，如果歌曲不在主队列则自动注入并起飞
   const playTrack = async (track: Track) => { 
-      const idx = playlist.queue.value.findIndex(t => t.id === track.id);
-      if (idx !== -1) await performTrackSwitch(() => { playlist.currentIndex.value = idx; }); 
+      let idx = playlist.queue.value.findIndex(t => t.id === track.id);
+      if (idx === -1) {
+          playlist.queue.value.push({ ...track, isAvailable: true });
+          idx = playlist.queue.value.length - 1;
+      }
+      await performTrackSwitch(() => { playlist.currentIndex.value = idx; }); 
   };
 
   const setChannelMode = async (mode: number): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
@@ -515,6 +585,11 @@ export const usePlayerStore = defineStore('player', () => {
           localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
 
           const finalMode = (engine.isTrueSurround.value && mode > 2) ? mode + 100 : mode;
+          //此处修复导入完成后切换环绕Deadlock
+          if (!hasStarted.value) {
+            invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
+            return 'SUCCESS';
+          }
           await invoke('player_set_channels', { mode: finalMode });
           
           if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
@@ -544,6 +619,10 @@ export const usePlayerStore = defineStore('player', () => {
           localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
 
           const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
+          if (!hasStarted.value) {
+            invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
+            return 'SUCCESS';
+          }
           await invoke('player_set_channels', { mode: finalMode });
           
           if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
@@ -764,8 +843,9 @@ export const usePlayerStore = defineStore('player', () => {
     ...engine,
     isPlaying, isPaused, hasStarted, volume, progress, currentTime, 
     isDragging, isBuffering, isSeeking, isSystemBusy, playSessionId, isTrackSwitching, 
-    isImporting, importCount, importTotal, importProgress, lastActiveVolume, showCredits, 
+    isImporting, importCount, importTotal, importProgress, lastActiveVolume, showCredits, needsInitialization,
 
+    likedQueue, toggleLike, isLiked,
     setNotifier, setVolume, toggleMute, togglePlay, nextTrack, prevTrack, 
     seekTo, switchEngine, loadAndPlay, initCheck, importTracks, 
     setOutputDevice, playTrack, setChannelMode, toggleTrueSurround, 
