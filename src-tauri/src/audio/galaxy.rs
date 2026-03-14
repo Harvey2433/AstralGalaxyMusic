@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use std::thread;
 
 use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
+use rodio::cpal::traits::{HostTrait, DeviceTrait};
 
 macro_rules! debug_log {
     ($($arg:tt)*) => ({
@@ -26,7 +27,59 @@ pub enum ChannelConfig {
 }
 
 // =================================================================
-// 🚀 性能核弹级优化的 Rubato Sinc 重采样器 (防卡顿 + 低 CPU 占用版)
+// 🧠 动态硬件采样率嗅探器
+// =================================================================
+fn get_dynamic_target_sr() -> u32 {
+    if let Some(device) = rodio::cpal::default_host().default_output_device() {
+        if let Ok(config) = device.default_output_config() {
+            let sr = config.sample_rate().0;
+            debug_log!("Dynamic SR Detection: Target device runs at {}Hz. Perfect match engaged.", sr);
+            return sr;
+        }
+    }
+    debug_log!("Dynamic SR Detection failed, falling back to 48000Hz.");
+    48000
+}
+
+// =================================================================
+// 👑 终极特权：系统级 MMCSS 原生注入模块 (零外部依赖)
+// =================================================================
+#[cfg(target_os = "windows")]
+pub mod mmcss {
+    use std::ffi::c_void;
+    
+    #[link(name = "avrt")]
+    extern "system" {
+        pub fn AvSetMmThreadCharacteristicsW(TaskName: *const u16, TaskIndex: *mut u32) -> *mut c_void;
+        pub fn AvSetMmThreadPriority(AvrtHandle: *mut c_void, Priority: i32) -> i32;
+    }
+    
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn SetThreadPriority(hThread: *mut c_void, nPriority: i32) -> i32;
+        pub fn GetCurrentThread() -> *mut c_void;
+    }
+
+    pub fn elevate_thread() {
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), 2);
+            let mut task_index = 0;
+            let task_name: [u16; 10] = [0x50, 0x72, 0x6f, 0x20, 0x41, 0x75, 0x64, 0x69, 0x6f, 0x00];
+            let handle = AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index);
+            if !handle.is_null() {
+                AvSetMmThreadPriority(handle, 2);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub mod mmcss {
+    pub fn elevate_thread() {}
+}
+
+// =================================================================
+// 🚀 发烧级 Rubato Sinc 重采样器
 // =================================================================
 pub struct RubatoSource<I: Source<Item = f32>> {
     input: I,
@@ -47,6 +100,7 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         let channels = input.channels() as usize;
 
         if source_sr == target_sr {
+            debug_log!("Source SR ({}) matches Target SR. Bypassing Resampler.", source_sr);
             return Self {
                 input, resampler: None, input_buffers: vec![], output_buffer: vec![],
                 output_pos: 0, channels, chunk_size: 0, target_sr, source_sr, exhausted: false,
@@ -54,16 +108,13 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         }
 
         debug_log!("Rubato Resampler Activated: {}Hz -> {}Hz", source_sr, target_sr);
+        let chunk_size = 2048; 
         
-        let chunk_size = 1024; 
-        
-        // 🔥 性能优化核心：使用 Linear 插值 + 32阶查表
-        // 提供 CD 级的无损音质，但 CPU 计算量仅为之前的 1/10！彻底杜绝抢占游戏算力。
         let params = SincInterpolationParameters {
-            sinc_len: 32, 
-            f_cutoff: 0.90, 
-            interpolation: SincInterpolationType::Linear, 
-            oversampling_factor: 32, 
+            sinc_len: 256, 
+            f_cutoff: 0.985, 
+            interpolation: SincInterpolationType::Cubic, 
+            oversampling_factor: 256, 
             window: WindowFunction::BlackmanHarris2,
         };
 
@@ -86,9 +137,7 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
 
     fn process_next_chunk(&mut self) {
         if self.resampler.is_none() || self.exhausted { return; }
-
         for ch in 0..self.channels { self.input_buffers[ch].clear(); }
-
         let mut frames_read = 0;
         for _ in 0..self.chunk_size {
             let mut frame_complete = false;
@@ -96,15 +145,11 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
                 if let Some(s) = self.input.next() {
                     self.input_buffers[ch].push(s);
                     if ch == self.channels - 1 { frame_complete = true; }
-                } else {
-                    break;
-                }
+                } else { break; }
             }
             if !frame_complete {
                 for ch in 0..self.channels {
-                    while self.input_buffers[ch].len() < self.chunk_size {
-                        self.input_buffers[ch].push(0.0);
-                    }
+                    while self.input_buffers[ch].len() < self.chunk_size { self.input_buffers[ch].push(0.0); }
                 }
                 self.exhausted = true;
                 break;
@@ -113,20 +158,21 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         }
 
         if frames_read == 0 && self.exhausted { return; }
-
         let out_buffers = self.resampler.as_mut().unwrap().process(&self.input_buffers, None).unwrap();
         self.output_buffer.clear();
         let out_frames = out_buffers[0].len();
-
         let valid_out_frames = if self.exhausted {
             (frames_read as f64 * (self.target_sr as f64 / self.source_sr as f64)).round() as usize
-        } else {
-            out_frames
-        };
+        } else { out_frames };
 
         for i in 0..valid_out_frames.min(out_frames) {
             for ch in 0..self.channels {
-                self.output_buffer.push(out_buffers[ch][i]);
+                let mut sample = out_buffers[ch][i];
+                if sample.abs() > 0.95 {
+                    let overshoot = sample.abs() - 0.95;
+                    sample = sample.signum() * (0.95 + overshoot * 0.5);
+                }
+                self.output_buffer.push(sample);
             }
         }
         self.output_pos = 0;
@@ -135,17 +181,14 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
 
 impl<I: Source<Item = f32>> Iterator for RubatoSource<I> {
     type Item = f32;
-
     #[inline(always)]
     fn next(&mut self) -> Option<f32> {
         if self.resampler.is_none() { return self.input.next(); }
-
         if self.output_pos >= self.output_buffer.len() {
             if self.exhausted { return None; }
             self.process_next_chunk();
             if self.output_pos >= self.output_buffer.len() { return None; }
         }
-
         let val = self.output_buffer[self.output_pos];
         self.output_pos += 1;
         Some(val)
@@ -159,15 +202,11 @@ impl<I: Source<Item = f32>> Source for RubatoSource<I> {
     fn total_duration(&self) -> Option<Duration> { self.input.total_duration() }
 }
 
-
 // =================================================================
-// 空间处理器
+// 空间混音与软拐点压限器
 // =================================================================
 pub struct SpatialProcessor {
-    lfe_state: f32,
-    delay_buffer: Vec<(f32, f32)>, 
-    delay_pos: usize,
-    alpha: f32,
+    lfe_state: f32, delay_buffer: Vec<(f32, f32)>, delay_pos: usize, alpha: f32,
 }
 
 impl SpatialProcessor {
@@ -176,25 +215,15 @@ impl SpatialProcessor {
         let dt = 1.0 / sample_rate as f32;
         let rc = 1.0 / (2.0 * std::f32::consts::PI * 120.0);
         let alpha = dt / (rc + dt);
-        
-        Self { 
-            lfe_state: 0.0, 
-            delay_buffer: vec![(0.0, 0.0); delay_samples.max(1)], 
-            delay_pos: 0, 
-            alpha 
-        }
+        Self { lfe_state: 0.0, delay_buffer: vec![(0.0, 0.0); delay_samples.max(1)], delay_pos: 0, alpha }
     }
-
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32, f32) {
         let mono = (l + r) * 0.5;
         self.lfe_state += self.alpha * (mono - self.lfe_state);
-        let lfe_out = self.lfe_state;
-
         let (delayed_l, delayed_r) = self.delay_buffer[self.delay_pos];
         self.delay_buffer[self.delay_pos] = (l, r);
         self.delay_pos = (self.delay_pos + 1) % self.delay_buffer.len();
-
-        (lfe_out, delayed_l, delayed_r)
+        (self.lfe_state, delayed_l, delayed_r)
     }
 }
 
@@ -205,7 +234,6 @@ pub struct UpmixSource<I: Source<Item = f32>> {
     current_frame: Vec<f32>,
     dsp: SpatialProcessor, 
     
-    // DC Block (拦截直流偏移)
     dc_l: f32, dc_r: f32,
     prev_l: f32, prev_r: f32,
     
@@ -216,6 +244,8 @@ pub struct UpmixSource<I: Source<Item = f32>> {
     master_vol_target: Arc<AtomicU32>,
     master_vol_current: f32,
     master_vol_alpha: f32,
+    
+    is_first_run: bool, 
 }
 
 impl<I: Source<Item = f32>> UpmixSource<I> {
@@ -225,41 +255,26 @@ impl<I: Source<Item = f32>> UpmixSource<I> {
             6 => (6, true), 8 => (8, true), 106 => (6, false), 108 => (8, false), _ => (2, false),
         };
         Self { 
-            input, 
-            target_channels, 
-            virtualize, 
-            current_frame: Vec::with_capacity(8), 
+            input, target_channels, virtualize, current_frame: Vec::with_capacity(8), 
             dsp: SpatialProcessor::new(sample_rate),
-            
             dc_l: 0.0, dc_r: 0.0, prev_l: 0.0, prev_r: 0.0,
-            
-            is_playing_flag,
-            state_vol: 0.0, 
-            fade_step: 1.0 / (sample_rate.max(1) as f32 * 0.03), 
-            
+            is_playing_flag, state_vol: 0.0, fade_step: 1.0 / (sample_rate.max(1) as f32 * 0.03), 
             master_vol_current: f32::from_bits(master_vol_target.load(Ordering::Relaxed)),
-            master_vol_target,
-            master_vol_alpha: 1.0 / (sample_rate.max(1) as f32 * 0.02), 
+            master_vol_target, master_vol_alpha: 1.0 / (sample_rate.max(1) as f32 * 0.02), 
+            is_first_run: true,
         }
     }
 
+    // 🔥 终极修复：驯服“反相抑制”
+    // 拔掉所有的额外增益，将保护阈值推到 0.98，仅作为防爆砖！
     #[inline(always)]
     fn audiophile_limiter(mut val: f32) -> f32 {
-        // 🔥 终极响度与防爆音解决方案！
-        // 1. 基础响度提升 25%，直接秒杀 MusicPlayer2 的弱鸡音量
-        val *= 1.25; 
-        
         let abs_val = val.abs();
-        if abs_val <= 0.6 {
-            // 安全区内，纯线性直通，保留 100% 原始动态细节
-            val
+        if abs_val <= 0.98 {
+            val // 0.98 以内，原汁原味，零修改！
         } else {
-            // 2. 顶级 DSP 软拐点压缩 (Soft-Knee Dynamic Compressor)
-            // 超过 0.6 的波峰会被这条平滑曲线完美接住，像海绵一样吸收冲击力
-            // 理论上哪怕输入巨大，输出也无限逼近但绝不等于 1.0！彻底消灭硬切撕裂声！
-            let diff = abs_val - 0.6;
-            let soft = 0.6 + diff / (1.0 + diff * 2.5);
-            val.signum() * soft
+            let diff = abs_val - 0.98;
+            val.signum() * (0.98 + diff / (1.0 + diff * 8.0)) // 极硬拐点，仅在要爆破时才出手
         }
     }
 }
@@ -267,14 +282,17 @@ impl<I: Source<Item = f32>> UpmixSource<I> {
 impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
+        if self.is_first_run {
+            self.is_first_run = false;
+            mmcss::elevate_thread();
+            debug_log!("Real-time Audio Callback Thread elevated to MMCSS Pro Audio!");
+        }
+
         if self.current_frame.is_empty() {
             let target_state = if self.is_playing_flag.load(Ordering::Relaxed) { 1.0 } else { 0.0 };
             if self.state_vol != target_state {
-                if self.state_vol < target_state {
-                    self.state_vol = (self.state_vol + self.fade_step).min(target_state);
-                } else {
-                    self.state_vol = (self.state_vol - self.fade_step).max(target_state);
-                }
+                if self.state_vol < target_state { self.state_vol = (self.state_vol + self.fade_step).min(target_state); } 
+                else { self.state_vol = (self.state_vol - self.fade_step).max(target_state); }
             }
             let m = self.state_vol;
 
@@ -285,28 +303,17 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
             }
 
             let smooth_state_vol = m * m * (3.0 - 2.0 * m);
-
             let target_master = f32::from_bits(self.master_vol_target.load(Ordering::Relaxed));
             let vol_diff = target_master - self.master_vol_current;
-            if vol_diff.abs() > 0.0001 {
-                self.master_vol_current += vol_diff * self.master_vol_alpha;
-            } else {
-                self.master_vol_current = target_master;
-            }
+            if vol_diff.abs() > 0.0001 { self.master_vol_current += vol_diff * self.master_vol_alpha; } 
+            else { self.master_vol_current = target_master; }
 
             let final_gain = smooth_state_vol * self.master_vol_current;
 
-            let raw_l = match self.input.next() {
-                Some(v) => v,
-                None => return None, 
-            };
+            let raw_l = match self.input.next() { Some(v) => v, None => return None };
             let raw_r = if self.input.channels() == 1 { raw_l } else { self.input.next().unwrap_or(raw_l) };
-            
-            if self.input.channels() > 2 {
-                for _ in 2..self.input.channels() { let _ = self.input.next(); }
-            }
+            if self.input.channels() > 2 { for _ in 2..self.input.channels() { let _ = self.input.next(); } }
 
-            // DC Block 拦截直流偏置，防止波形偏离中心线
             let l = raw_l - self.prev_l + 0.995 * self.dc_l;
             let r = raw_r - self.prev_r + 0.995 * self.dc_r;
             self.dc_l = l; self.dc_r = r;
@@ -345,9 +352,14 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
                 if self.target_channels == 8 {
                     self.current_frame.push(Self::audiophile_limiter(rear_l_raw * 0.8 * final_gain)); 
                     self.current_frame.push(Self::audiophile_limiter(rear_r_raw * 0.8 * final_gain)); 
+                } else {
+                    // 🔥 核心修复：如果是 5.1 模式，我们强行压入 2 个静音采样！
+                    // 作用：将 6 个采样补齐到 8 个采样（偶数对齐），彻底消灭声道漂移导致的电音！
+                    // 这样即便在双声道耳机下，Rodio 也能永远精准抓到 L 和 R，而不会把 C 抓给你的耳朵！
+                    self.current_frame.push(0.0); // 填充位 1 (Fake BL)
+                    self.current_frame.push(0.0); // 填充位 2 (Fake BR)
                 }
             }
-            
             self.current_frame.reverse(); 
         }
         self.current_frame.pop()
@@ -361,19 +373,18 @@ impl<I: Source<Item = f32>> Source for UpmixSource<I> {
     fn total_duration(&self) -> Option<Duration> { self.input.total_duration() }
 }
 
+// =================================================================
+// 后台零拷贝内存源引擎 (最核心的 O(1) 瞬切基石)
+// =================================================================
 #[derive(Clone)]
 pub struct ArcSliceSource {
-    data: Arc<Vec<f32>>,
-    pos: usize,
-    channels: u16,
-    sample_rate: u32,
+    data: Arc<Vec<f32>>, pos: usize, channels: u16, sample_rate: u32,
 }
 
 impl ArcSliceSource {
     pub fn new(data: Arc<Vec<f32>>, channels: u16, sample_rate: u32) -> Self {
         Self { data, pos: 0, channels, sample_rate }
     }
-
     pub fn skip_duration(mut self, duration: Duration) -> Self {
         let offset = (duration.as_secs_f64() * self.sample_rate as f64 * self.channels as f64) as usize;
         self.pos = offset.min(self.data.len());
@@ -386,13 +397,7 @@ impl Iterator for ArcSliceSource {
     type Item = f32;
     #[inline(always)]
     fn next(&mut self) -> Option<f32> {
-        if self.pos < self.data.len() {
-            let val = self.data[self.pos];
-            self.pos += 1;
-            Some(val)
-        } else {
-            None
-        }
+        if self.pos < self.data.len() { let val = self.data[self.pos]; self.pos += 1; Some(val) } else { None }
     }
 }
 
@@ -406,6 +411,9 @@ impl Source for ArcSliceSource {
     }
 }
 
+// =================================================================
+// GalaxyEngine 主控 (Adaptive Sync Core)
+// =================================================================
 pub struct GalaxyEngine {
     sink: Arc<Mutex<Sink>>,
     stream_handle: OutputStreamHandle,
@@ -418,7 +426,6 @@ pub struct GalaxyEngine {
     channels: u16,
     current_volume: Arc<AtomicU32>, 
     channel_mode: Arc<RwLock<ChannelConfig>>,
-    
     playback_pos: Arc<RwLock<f64>>,
     last_play_instant: Arc<RwLock<Option<Instant>>>,
     fade_token: Arc<AtomicUsize>, 
@@ -435,7 +442,7 @@ impl GalaxyEngine {
             is_decoded: Arc::new(AtomicBool::new(false)),
             decode_session: Arc::new(AtomicUsize::new(0)),
             is_playing: Arc::new(AtomicBool::new(false)), 
-            sample_rate: 44100,
+            sample_rate: 44100, 
             channels: 2,
             current_volume: Arc::new(AtomicU32::new(1f32.to_bits())),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
@@ -460,14 +467,13 @@ impl GalaxyEngine {
 }
 
 impl AudioEngine for GalaxyEngine {
-    fn name(&self) -> &str { "Galaxy DSP (Audiophile Limit + Low CPU)" }
+    fn name(&self) -> &str { "Galaxy DSP (Adaptive Sync Core)" }
 
     fn update_output_stream(&mut self, handle: OutputStreamHandle) {
         if self.is_playing.load(Ordering::SeqCst) {
             self.is_playing.store(false, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(40)); 
         }
-        
         let current_time = self.get_current_time();
         self.stream_handle = handle.clone();
         self.seek(current_time);
@@ -487,7 +493,8 @@ impl AudioEngine for GalaxyEngine {
 
         let source = Self::create_decoder(&raw_bytes)?;
         
-        let hq_source = RubatoSource::new(source.convert_samples::<f32>(), 44100);
+        let target_sr = get_dynamic_target_sr();
+        let hq_source = RubatoSource::new(source.convert_samples::<f32>(), target_sr);
         
         self.sample_rate = hq_source.sample_rate(); 
         self.channels = hq_source.channels();
@@ -505,11 +512,9 @@ impl AudioEngine for GalaxyEngine {
         {
             let mut sink_guard = self.sink.lock().unwrap();
             *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
-            
             sink_guard.set_volume(1.0);
             let mixed_source = UpmixSource::new(hq_source, *self.channel_mode.read().unwrap() as u16, self.is_playing.clone(), self.current_volume.clone());
             sink_guard.append(mixed_source);
-            
             sink_guard.play(); 
         }
 
@@ -519,23 +524,25 @@ impl AudioEngine for GalaxyEngine {
         let samples_ref = self.decoded_samples.clone();
         let is_decoded_ref = self.is_decoded.clone();
         let raw_bytes_clone = raw_bytes.clone();
+        let bg_target_sr = target_sr; 
 
         thread::spawn(move || {
-            debug_log!("Background full-decode started...");
+            // 🔥 修复：取消后台解码线程的 MMCSS 特权！
+            // 绝不允许它和实时播放线程抢夺 CPU，让它乖乖在 Normal 优先级跑！
+            debug_log!("Background full-decode thread started (Normal Priority to protect real-time stream!).");
+            
             if let Ok(decoder) = Decoder::new(Cursor::new(raw_bytes_clone.to_vec())) {
-                let hq_source = RubatoSource::new(decoder.convert_samples::<f32>(), 44100);
-                let mut pcm_buffer = Vec::with_capacity(44100 * 2 * 180); 
+                let hq_source = RubatoSource::new(decoder.convert_samples::<f32>(), bg_target_sr);
+                let mut pcm_buffer = Vec::with_capacity(bg_target_sr as usize * 2 * 180); 
                 let mut count = 0;
                 
                 for sample in hq_source {
                     pcm_buffer.push(sample);
                     count += 1;
                     
-                    // 🔥 降维打击 CPU 杀手：每解码 0.25 秒的音频 (22050 采样点)
-                    // 强制休眠 40ms。将占用率控制在 2~5% 左右，彻底杜绝与游戏的算力抢占！
-                    if count % 22050 == 0 {
+                    if count % 4096 == 0 {
                         if session_ref.load(Ordering::SeqCst) != my_session { return; }
-                        thread::sleep(Duration::from_millis(40));
+                        thread::sleep(Duration::from_millis(1));
                     }
                 }
                 
@@ -552,20 +559,15 @@ impl AudioEngine for GalaxyEngine {
 
     fn play(&mut self) { 
         if self.is_playing.swap(true, Ordering::SeqCst) { return; }
-        
         *self.last_play_instant.write().unwrap() = Some(Instant::now());
         self.fade_token.fetch_add(1, Ordering::SeqCst); 
-        
         if let Ok(s) = self.sink.lock() { s.play(); } 
     }
     
     fn pause(&mut self) { 
         if !self.is_playing.swap(false, Ordering::SeqCst) { return; }
-        
         let mut pos = self.playback_pos.write().unwrap();
-        if let Some(i) = self.last_play_instant.write().unwrap().take() {
-            *pos += i.elapsed().as_secs_f64();
-        }
+        if let Some(i) = self.last_play_instant.write().unwrap().take() { *pos += i.elapsed().as_secs_f64(); }
 
         let my_token = self.fade_token.fetch_add(1, Ordering::SeqCst) + 1;
         let token_ref = self.fade_token.clone();
@@ -582,46 +584,30 @@ impl AudioEngine for GalaxyEngine {
 
     fn seek(&mut self, time: f64) {
         let is_playing_now = self.is_playing.load(Ordering::SeqCst);
-
         if is_playing_now {
             self.is_playing.store(false, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(40)); 
+            if let Ok(s) = self.sink.lock() { s.pause(); }
         }
 
         *self.playback_pos.write().unwrap() = time;
         *self.last_play_instant.write().unwrap() = if is_playing_now { Some(Instant::now()) } else { None };
 
-        {
-            let mut sink_guard = self.sink.lock().unwrap();
-            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
-            sink_guard.pause(); 
+        if !self.is_decoded.load(Ordering::Acquire) {
+            debug_log!("Seek triggered before full-decode complete. Synchronously waiting for background process...");
+            while !self.is_decoded.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            debug_log!("Background process finished! Executing zero-copy instant seek.");
         }
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
-        let sink_guard = self.sink.lock().unwrap();
+        let mut sink_guard = self.sink.lock().unwrap();
+        *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
         
-        if self.is_decoded.load(Ordering::Acquire) {
-            if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
-                debug_log!("Executing True O(1) zero-copy memory seek...");
-                let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate)
-                    .skip_duration(Duration::from_secs_f64(time));
-                sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
-            }
-        } else {
-            debug_log!("Falling back to slow IO seek...");
-            if let Some(data) = &self.raw_bytes {
-                if let Ok(mut src) = Self::create_decoder(data) {
-                    if src.try_seek(Duration::from_secs_f64(time)).is_ok() {
-                        let hq_source = RubatoSource::new(src.convert_samples::<f32>(), 44100);
-                        sink_guard.append(UpmixSource::new(hq_source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
-                    } else {
-                        let fallback = Self::create_decoder(data).unwrap();
-                        let hq_source = RubatoSource::new(fallback.convert_samples::<f32>(), 44100);
-                        let skipped = hq_source.skip_duration(Duration::from_secs_f64(time));
-                        sink_guard.append(UpmixSource::new(skipped, target_channels, self.is_playing.clone(), self.current_volume.clone()));
-                    }
-                }
-            }
+        if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
+            let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate)
+                .skip_duration(Duration::from_secs_f64(time));
+            sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
         }
         
         sink_guard.set_volume(1.0); 
@@ -637,11 +623,8 @@ impl AudioEngine for GalaxyEngine {
 
     fn set_channel_mode(&mut self, _mode: u16) {
         let config = match _mode {
-            6 => ChannelConfig::Surround51, 
-            8 => ChannelConfig::Surround71, 
-            106 => ChannelConfig::True51,
-            108 => ChannelConfig::True71,
-            _ => ChannelConfig::Stereo,
+            6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, 
+            106 => ChannelConfig::True51, 108 => ChannelConfig::True71, _ => ChannelConfig::Stereo,
         };
         *self.channel_mode.write().unwrap() = config;
     }

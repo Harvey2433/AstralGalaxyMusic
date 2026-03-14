@@ -51,9 +51,9 @@ zip = "2.2"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
 tokio = { version = "1.50.0", features = ["time"] }
 
-# 🔥 极致优化配置
-#[profile.dev.package."*"]
-#opt-level = 3
+# Dev 3级优化配置
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = 3
