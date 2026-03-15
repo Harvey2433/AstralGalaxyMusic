@@ -47,6 +47,7 @@ pub struct AudioManager {
     stream_handle: OutputStreamHandle,
     pub current_device_mode: String,
     pub last_resolved_default: String,
+    pub current_volume: f32, // 新增：用于在引擎切换间隙暂存音量
 }
 
 impl AudioManager {
@@ -92,6 +93,7 @@ impl AudioManager {
             stream_handle,
             current_device_mode: "Default".to_string(),
             last_resolved_default: default_name,
+            current_volume: 0.8, // 新增：初始化默认音量为 80%
         }
     }
 
@@ -187,7 +189,7 @@ impl AudioManager {
 
     pub fn switch_engine(&mut self, engine_id: &str) -> Result<String, String> {
         self.check_and_recover_default_device();
-        match engine_id {
+        let res = match engine_id {
             "galaxy" => {
                 self.active_engine = Box::new(galaxy::GalaxyEngine::new(self.stream_handle.clone()));
                 Ok("ENGINE_GALAXY_READY".to_string())
@@ -197,7 +199,14 @@ impl AudioManager {
                 Ok("ENGINE_FFMPEG_READY".to_string())
             }
             _ => Err("UNKNOWN_ENGINE".to_string())
+        };
+
+        // 核心增量：给新引擎注入旧音量，防止切换后归零或震耳欲聋
+        if res.is_ok() {
+            self.active_engine.set_volume(self.current_volume);
         }
+
+        res
     }
 
     pub fn load(&mut self, path: &str) -> Result<f64, String> { 
@@ -213,6 +222,9 @@ impl AudioManager {
         self.check_and_recover_default_device();
         self.active_engine.seek(time) 
     }
-    pub fn set_volume(&mut self, vol: f32) { self.active_engine.set_volume(vol) }
+    pub fn set_volume(&mut self, vol: f32) { 
+        self.current_volume = vol; // 新增：记录当前音量到管理层
+        self.active_engine.set_volume(vol) 
+    }
     pub fn set_channels(&mut self, mode: u16) { self.active_engine.set_channel_mode(mode); }
 }

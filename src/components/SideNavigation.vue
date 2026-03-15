@@ -13,7 +13,7 @@ const toggleMoreMenu = () => {
   showMoreMenu.value = !showMoreMenu.value;
 };
 
-// 🔥 无感点击外部拦截核心：不阻断事件冒泡，只负责关闭菜单
+// 无感点击外部拦截核心：不阻断事件冒泡，只负责关闭菜单
 const closeMenuOnClickOutside = (e: MouseEvent) => {
   if (!showMoreMenu.value) return;
   if (moreBtnRef.value && moreBtnRef.value.contains(e.target as Node)) return;

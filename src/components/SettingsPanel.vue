@@ -108,7 +108,7 @@ onUnmounted(() => {
   <Transition name="panel-fade">
     <div class="absolute inset-0 z-30 flex bg-cosmos-950/80 backdrop-blur-xl">
       
-      <div class="w-64 h-full bg-black/40 flex flex-col p-6 z-20 border-r border-white/5 shadow-[10px_0_30px_rgba(0,0,0,0.5)]">
+      <div class="w-64 h-full bg-black/40 flex flex-col p-6 z-20 border-r border-white/5 shadow-[10px_0_30px_rgba(0,0,0,0.5)] shrink-0">
         <h2 class="text-xl font-orbitron font-bold text-white mb-8 flex items-center gap-2"><Settings :size="20" class="text-starlight-purple"/> SETTINGS</h2>
         <nav class="space-y-2 flex-1">
           <button @click="activeSettingTab = 'core'" class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] text-sm font-bold tracking-wider active:scale-95 no-drag-btn no-outline" :class="activeSettingTab === 'core' ? 'bg-starlight-cyan/15 text-starlight-cyan shadow-[0_4px_15px_rgba(100,255,218,0.1)]' : 'text-white/40 hover:text-white hover:bg-white/10'"><Terminal :size="18" /> CORE SYSTEM</button>
@@ -121,8 +121,8 @@ onUnmounted(() => {
       <div class="flex-1 h-full relative z-10">
         <Transition name="slide-up-fade" mode="out-in">
           
-          <div v-if="activeSettingTab === 'core'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10">
-            <div class="max-w-4xl">
+          <div v-if="activeSettingTab === 'core'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10 flex flex-col items-center justify-center">
+            <div class="w-full max-w-3xl">
                 <div class="mb-8 flex items-end justify-between">
                     <div><h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3><p class="text-sm text-white/40">Select the audio core driver for signal processing.</p></div>
                     <div class="flex items-center gap-2 bg-black/40 p-2 px-3 rounded-lg border border-white/5"><Activity :size="14" class="text-starlight-cyan" /><span class="text-xs font-mono text-starlight-cyan/80">LATENCY: NORMAL</span></div>
@@ -134,13 +134,13 @@ onUnmounted(() => {
                     :class="[
                        (targetEngineId === engine.id && engineState === 'failed') ? 'border-red-500 bg-red-500/10' :
                        (targetEngineId === engine.id && engineState === 'switching') ? 'border-yellow-400 bg-yellow-400/10' :
-                       (player.activeEngine === engine.id && engineState === 'idle') ? `bg-opacity-20 ${engine.border} ${engine.glow} z-10 scale-[1.02]` :
-                       (engine.id === 'ffmpeg' && player.isDownloadingFFmpeg) ? 'border-yellow-400 bg-yellow-400/10' :
+                       (engine.id === 'ffmpeg' && player.isDownloadingFFmpeg) ? 'border-yellow-400 bg-yellow-400/10 shadow-[0_0_15px_rgba(250,204,21,0.2)] z-10 scale-[1.02]' :
+                       (player.activeEngine === engine.id && engineState === 'idle' && !player.isDownloadingFFmpeg) ? `bg-opacity-20 ${engine.border} ${engine.glow} z-10 scale-[1.02]` :
                        'border-white/5 hover:border-white/20 hover:shadow-lg z-0',
-                       (engineState === 'switching' && targetEngineId !== engine.id) ? 'opacity-50 grayscale scale-[0.98]' : 'opacity-100'
+                       ((engineState === 'switching' && targetEngineId !== engine.id) || (player.isDownloadingFFmpeg && engine.id !== 'ffmpeg')) ? 'opacity-40 grayscale scale-[0.98] pointer-events-none' : 'opacity-100'
                     ]">
                     
-                    <div v-if="player.activeEngine === engine.id && engineState === 'idle'" class="absolute top-0 right-0 p-4">
+                    <div v-if="player.activeEngine === engine.id && engineState === 'idle' && !(engine.id === 'ffmpeg' && player.isDownloadingFFmpeg)" class="absolute top-0 right-0 p-4">
                         <div class="flex items-center gap-2"><span class="text-[10px] font-bold tracking-widest" :class="engine.color">ACTIVE</span><div class="w-2 h-2 rounded-full animate-pulse" :class="engine.color.replace('text-', 'bg-')"></div></div>
                     </div>
 
@@ -159,8 +159,8 @@ onUnmounted(() => {
             </div>
           </div>
           
-          <div v-else-if="activeSettingTab === 'audio'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10">
-              <div class="max-w-4xl">
+          <div v-else-if="activeSettingTab === 'audio'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10 flex flex-col items-center justify-center">
+              <div class="w-full max-w-3xl">
                   <h3 class="text-2xl font-bold text-white mb-2">Audio Channels</h3>
                   <p class="text-sm text-white/40 mb-8">Configure output mapping for surround sound systems.</p>
 
@@ -216,8 +216,8 @@ onUnmounted(() => {
               </div>
           </div>
           
-           <div v-else-if="activeSettingTab === 'display'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10">
-               <div class="max-w-4xl">
+           <div v-else-if="activeSettingTab === 'display'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10 flex flex-col items-center justify-center">
+               <div class="w-full max-w-3xl">
                    <h3 class="text-2xl font-bold text-white mb-2">Hologram UI & System Integration</h3>
                    <p class="text-sm text-white/40 mb-8">Configure system-level UI integrations and display features.</p>
                    

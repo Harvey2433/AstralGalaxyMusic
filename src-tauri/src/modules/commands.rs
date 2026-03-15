@@ -120,3 +120,19 @@ pub async fn get_current_time(state: State<'_, AppState>) -> Result<f64, String>
     state.audio_tx.send(AudioCommand::GetCurrentTime(tx)).map_err(|e| e.to_string())?;
     rx.await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub fn check_ffmpeg_exists(window: Window) -> bool {
+    FFmpegEngine::check_availability(window.app_handle())
+}
+
+#[tauri::command]
+pub fn start_ffmpeg_download(window: Window) {
+    let win_clone = window.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = FFmpegEngine::download_and_install(win_clone.clone()).await {
+            println!("FFmpeg install failed: {}", e);
+            let _ = win_clone.emit("ffmpeg-status", "error");
+        }
+    });
+}

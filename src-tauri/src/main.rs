@@ -46,7 +46,7 @@ pub struct AstralData {
     pub liked_tracks: serde_json::Value, 
 }
 
-// 🔥 后端实时持久化快照：存储于静态内存，确保退出信号触发时无需等待 IPC 直接落盘
+// 后端实时持久化快照：存储于静态内存，确保退出信号触发时无需等待 IPC 直接落盘
 static PERSISTENCE_SNAPSHOT: Mutex<Option<AstralData>> = Mutex::new(None);
 
 struct SmtcHandle {
@@ -282,7 +282,7 @@ fn main() {
         .manage(AppState { audio_tx })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
-                // 🔥 物理级强制保存：从静态内存快照中瞬间提取并同步写入硬盘
+                // 物理级强制保存：从静态内存快照中瞬间提取并同步写入硬盘
                 perform_final_save(window.app_handle());
                 println!("[CORE] Final snapshot sync completed. Exiting.");
             }
@@ -336,7 +336,7 @@ fn main() {
             get_lyrics, get_current_engine, get_current_time,
             sync_smtc_metadata, sync_smtc_status,
             toggle_smtc_active, init_persistence_layer, load_astral_data,
-            update_persistence_snapshot
+            update_persistence_snapshot, check_ffmpeg_exists, start_ffmpeg_download
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

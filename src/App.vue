@@ -57,7 +57,7 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
 };
 
 // ==========================================
-// 🔥 Windows SMTC 状态实时同步
+// Windows SMTC 状态实时同步
 // ==========================================
 let isSmtcActiveInBackend = false; 
 
@@ -115,7 +115,7 @@ onMounted(() => {
         listen('smtc-next', () => player.nextTrack()),
         listen('smtc-prev', () => player.prevTrack()),
         
-        // 🔥 终极修补：以后端硬件信号驱动前端总线锁
+        // 终极修补：以后端硬件信号驱动前端总线锁
         listen('force-pause', () => { 
             // 立即开启“灵动岛”Process拦截，防止用户在自动切换时乱点
             player.isSystemBusy = true;

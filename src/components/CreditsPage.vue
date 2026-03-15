@@ -91,7 +91,7 @@ const finishScrolling = () => {
     }, 5000);
 };
 
-// 🔥 真正的随机流星生成引擎 (大速度差版)
+// 真正的随机流星生成引擎 (大速度差版)
 const generateMeteor = () => {
     if (phase.value !== 'scrolling') return;
 
@@ -118,7 +118,7 @@ const generateMeteor = () => {
             startY: startY,
             endX: startX + travelX,
             endY: startY + dropY,
-            // 🔥 巨大的速度差：2.5秒(极快) 到 12秒(极慢) 之间随机分布
+            // 巨大的速度差：2.5秒(极快) 到 12秒(极慢) 之间随机分布
             duration: 2.5 + Math.random() * 9.5 
         });
 
@@ -238,13 +238,10 @@ onUnmounted(() => {
     animation: blinkStars 6s ease-in-out infinite;
 }
 
-/* ========================================== */
-/* 🔥 横向掠过的流星动画 (短尾巴版) */
-/* ========================================== */
 .meteor {
    position: absolute;
    height: 1px; /* 极细线 */
-   width: 100px; /* 🔥 变短的拖尾 */
+   width: 100px; /* 变短的拖尾 */
    /* 从左到右：尾巴透明 -> 头部白光 */
    background: linear-gradient(to right, rgba(255,255,255,0) 0%, rgba(255,255,255,0.3) 50%, rgba(255,255,255,1) 100%);
    border-radius: 999px;

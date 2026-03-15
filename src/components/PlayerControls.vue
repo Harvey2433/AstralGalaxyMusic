@@ -24,7 +24,7 @@ const VolumeIcon = computed(() => {
 // --- 🛠️ 核心 Bug 修复：音量更新逻辑 ---
 
 const handleVolumeUpdate = (e: PointerEvent) => {
-  // 🔥 增加硬拦截：解码中禁止任何音量更新操作
+  // 增加硬拦截：解码中禁止任何音量更新操作
   if (player.isSeeking || player.isBuffering) return;
   if (!volumeBarRef.value) return;
   const rect = volumeBarRef.value.getBoundingClientRect();
@@ -52,7 +52,7 @@ const onPointerUp = (e: PointerEvent) => {
 };
 
 const startVolumeDrag = (e: PointerEvent) => { 
-  // 🔥 增加硬拦截：解码中禁止开始拖拽
+  // 增加硬拦截：解码中禁止开始拖拽
   if (player.isSeeking || player.isBuffering) return;
   if (!volumeBarRef.value) return;
   e.preventDefault();
