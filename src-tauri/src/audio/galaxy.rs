@@ -580,27 +580,18 @@ impl AudioEngine for GalaxyEngine {
             }
         });
 
-        // ✨ 唯一新加的核心逻辑：在这里乖乖等后台线程跑完再放行
-        debug_log!("Waiting for background full-decode to complete before returning load()...");
-        while !self.is_decoded.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        // ✨ 等待完成后，把已经准备好的零拷贝内存源挂上去
         {
-            let target_channels = *self.channel_mode.read().unwrap() as u16;
-            let mut sink_guard = self.sink.lock().unwrap();
-            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
-            sink_guard.set_volume(1.0);
-            
-            if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
-                let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate);
-                sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
-            }
-            
-            sink_guard.play(); 
+           let target_channels = *self.channel_mode.read().unwrap() as u16;
+           let mut sink_guard = self.sink.lock().unwrap();
+           *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+           sink_guard.set_volume(1.0);
+    
+           // 直接把第一步建立的实时流 hq_source 挂上去播放！
+           // 后台的解码线程 (raw_bytes_clone) 依然在偷偷跑，完全不影响这里秒播。
+           sink_guard.append(UpmixSource::new(hq_source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
+    
+           sink_guard.play(); 
         }
-
         Ok(total_duration)
     }
 
