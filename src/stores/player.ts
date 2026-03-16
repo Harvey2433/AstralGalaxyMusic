@@ -152,7 +152,7 @@ export const usePlayerStore = defineStore('player', () => {
                   }
               } catch (e) { }
           }
-      }, 2200);
+      }, 3000);
   };
 
   const syncEngine = async () => {
@@ -432,7 +432,7 @@ export const usePlayerStore = defineStore('player', () => {
         // 软启动逻辑：400ms 内平滑淡入到用户设定的音量，防止爆音
         const targetVol = Math.max(0.001, volume.value / 100.0);
         
-        smoothVolumeTransition(targetVol, 400, () => {
+        smoothVolumeTransition(targetVol, 50, () => {
             if (session === playActionSession && engine.isSmtcEnabled.value) {
                 invoke('sync_smtc_status', { isPlaying: true }).catch(()=>{});
             }
