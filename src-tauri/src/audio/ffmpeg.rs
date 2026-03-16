@@ -63,7 +63,8 @@ impl FFmpegEngine {
             sink: Arc::new(Mutex::new(sink)),
             stream_handle,
             current_samples: None,
-            sample_rate: 48000, 
+            // ✨ 优化：初始化时也直接嗅探硬件真实采样率，彻底消灭硬编码
+            sample_rate: get_dynamic_target_sr(), 
             current_volume: Arc::new(AtomicU32::new(1f32.to_bits())), 
             playback_pos: Arc::new(AtomicU64::new(f64_to_bits(0.0))),
             last_play_us: Arc::new(AtomicU64::new(u64::MAX)),

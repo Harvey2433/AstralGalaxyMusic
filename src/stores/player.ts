@@ -58,33 +58,43 @@ export const usePlayerStore = defineStore('player', () => {
   let lastIpcTime = 0;        
   let playActionSession = 0;  
 
-  // 实时持久化快照同步：将最新 UI 状态实时推送到后端内存，由后端在退出时执行物理落盘
+  // 实时持久化快照同步防抖
+  let persistenceTimeout: any = null;
   watch(
     () => [volume.value, engine.activeEngine.value, engine.channelMode.value, engine.isTrueSurround.value, engine.activeDevice.value, likedQueue.value],
     () => {
-        invoke('update_persistence_snapshot', {
-            data: {
-                settings: {
-                    volume: volume.value,
-                    engine_id: engine.activeEngine.value,
-                    channel_mode: engine.channelMode.value,
-                    is_true_surround: engine.isTrueSurround.value,
-                    output_device: engine.activeDevice.value
-                },
-                liked_tracks: likedQueue.value
-            }
-        }).catch(()=>{});
+        if (persistenceTimeout) clearTimeout(persistenceTimeout);
+        persistenceTimeout = setTimeout(() => {
+            invoke('update_persistence_snapshot', {
+                data: {
+                    settings: {
+                        volume: volume.value,
+                        engine_id: engine.activeEngine.value,
+                        channel_mode: engine.channelMode.value,
+                        is_true_surround: engine.isTrueSurround.value,
+                        output_device: engine.activeDevice.value
+                    },
+                    liked_tracks: likedQueue.value
+                }
+            }).catch(()=>{});
+        }, 1000);
     },
     { deep: true }
   );
 
+  // ✨ 核心修复：移除 isSystemBusy 拦截锁，保证切换引擎的瞬间音量能够准确发送至底层
+  let backendVolRafId: number | null = null;
   const setBackendVolume = (v: number) => {
-      if (isSystemBusy.value) return; 
       actualVolume = Math.max(0, Math.min(1, v));
-      // 物理级音量曲线修正：采用二次方映射以符合人耳听感，并由后端原子时钟调度
-      const logVol = Math.pow(actualVolume, 2); 
-      invoke('player_set_volume', { vol: logVol }).catch(()=>{});
-      lastIpcTime = performance.now();
+      
+      if (backendVolRafId === null) {
+          backendVolRafId = requestAnimationFrame(() => {
+              const logVol = Math.pow(actualVolume, 2); 
+              invoke('player_set_volume', { vol: logVol }).catch(()=>{});
+              lastIpcTime = performance.now();
+              backendVolRafId = null;
+          });
+      }
   };
 
   const smoothVolumeTransition = (targetVol: number, duration: number, onComplete?: () => void) => {
@@ -111,7 +121,6 @@ export const usePlayerStore = defineStore('player', () => {
 
           actualVolume = startVol + diff * fadeProgress;
 
-          // 节流处理：确保 IPC 管道每秒最高 30 次更新，防止 UI 线程阻塞
           if (timestamp - lastIpcTime > 33 || fadeProgress >= 1) {
               const logVol = Math.pow(actualVolume, 2);
               invoke('player_set_volume', { vol: logVol }).catch(()=>{});
@@ -129,14 +138,13 @@ export const usePlayerStore = defineStore('player', () => {
       fadeRafId = requestAnimationFrame(step);
   };
 
-  // ⏱️ 5秒级原子同步闭环：以后端零阻塞原子时钟为标准，无缝对齐前端视觉与歌词序列
   const startGlobalSyncTimer = () => {
       if (syncTimerId) clearInterval(syncTimerId);
       syncTimerId = setInterval(async () => {
           if (isPlaying.value && !isPaused.value && !isSystemBusy.value && !isDragging.value && !isSeeking.value && !isBuffering.value) {
               try {
                   const backendTime = await invoke<number>('get_current_time');
-                  if (Math.abs(currentTime.value - backendTime) > 0.5) {
+                  if (Math.abs(currentTime.value - backendTime) > 0.15) {
                       currentTime.value = backendTime;
                       if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
                           progress.value = (backendTime / playlist.currentTrack.value.duration) * 100;
@@ -144,7 +152,7 @@ export const usePlayerStore = defineStore('player', () => {
                   }
               } catch (e) { }
           }
-      }, 5000);
+      }, 2200);
   };
 
   const syncEngine = async () => {
@@ -217,7 +225,6 @@ export const usePlayerStore = defineStore('player', () => {
               engine.ffmpegProgress.value = 99;
               notifyUI.value?.('Extracting core...', 'info');
           } else if (status === 'ready') { 
-              engine.isDownloadingFFmpeg.value = false;
               engine.ffmpegProgress.value = 100;
               notifyUI.value?.('Core deployed');
               
@@ -256,6 +263,7 @@ export const usePlayerStore = defineStore('player', () => {
               } catch (err) {
                   notifyUI.value?.('FFmpeg failed', 'error');
               } finally {
+                  engine.isDownloadingFFmpeg.value = false;
                   engine.isEngineSwitching.value = false;
                   isSystemBusy.value = false;
                   isBuffering.value = false;
@@ -678,13 +686,22 @@ export const usePlayerStore = defineStore('player', () => {
       }
   };
 
+  // ✨ 修复 3：本地 LocalStorage 写操作防抖
+  let volSaveTimeout: any = null;
+  const saveActiveVolume = (v: number) => {
+      if (volSaveTimeout) clearTimeout(volSaveTimeout);
+      volSaveTimeout = setTimeout(() => {
+          localStorage.setItem('last_active_vol', v.toString());
+      }, 500);
+  };
+
   const setVolume = (v: number) => {
       // 🚀 已剥离 isDownloadingFFmpeg 锁
       if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
       volume.value = v;
       if (v > 0) {
           lastActiveVolume.value = v;
-          localStorage.setItem('last_active_vol', v.toString());
+          saveActiveVolume(v);
       }
   };
 
@@ -693,7 +710,7 @@ export const usePlayerStore = defineStore('player', () => {
       if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
       if (volume.value > 0) {
           lastActiveVolume.value = volume.value;
-          localStorage.setItem('last_active_vol', volume.value.toString());
+          saveActiveVolume(volume.value);
           volume.value = 0;
       } else {
           volume.value = lastActiveVolume.value;

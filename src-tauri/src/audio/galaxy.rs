@@ -60,6 +60,7 @@ fn get_dynamic_target_sr() -> u32 {
 #[cfg(target_os = "windows")]
 pub mod mmcss {
     use std::ffi::c_void;
+    use std::cell::Cell;
     
     #[link(name = "avrt")]
     extern "system" {
@@ -73,16 +74,26 @@ pub mod mmcss {
         pub fn GetCurrentThread() -> *mut c_void;
     }
 
+    // ✨ 保留修复：使用线程本地存储，防止同一物理线程被重复提权引发死锁
+    thread_local! {
+        static IS_ELEVATED: Cell<bool> = Cell::new(false);
+    }
+
     pub fn elevate_thread() {
-        unsafe {
-            SetThreadPriority(GetCurrentThread(), 2);
-            let mut task_index = 0;
-            let task_name: [u16; 10] = [0x50, 0x72, 0x6f, 0x20, 0x41, 0x75, 0x64, 0x69, 0x6f, 0x00];
-            let handle = AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index);
-            if !handle.is_null() {
-                AvSetMmThreadPriority(handle, 2);
+        IS_ELEVATED.with(|elevated| {
+            if !elevated.get() {
+                unsafe {
+                    SetThreadPriority(GetCurrentThread(), 2);
+                    let mut task_index = 0;
+                    let task_name: [u16; 10] = [0x50, 0x72, 0x6f, 0x20, 0x41, 0x75, 0x64, 0x69, 0x6f, 0x00];
+                    let handle = AvSetMmThreadCharacteristicsW(task_name.as_ptr(), &mut task_index);
+                    if !handle.is_null() {
+                        AvSetMmThreadPriority(handle, 2);
+                    }
+                }
+                elevated.set(true);
             }
-        }
+        });
     }
 }
 
@@ -195,7 +206,7 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
 impl<I: Source<Item = f32>> Iterator for RubatoSource<I> {
     type Item = f32;
     #[inline(always)]
-    fn next(&mut self) -> Option<f32> {
+    fn next(&mut self) -> Option<f32> {     
         if self.resampler.is_none() { return self.input.next(); }
         if self.output_pos >= self.output_buffer.len() {
             if self.exhausted { return None; }
@@ -535,15 +546,6 @@ impl AudioEngine for GalaxyEngine {
 
         self.fade_token.fetch_add(1, Ordering::SeqCst); 
 
-        {
-            let mut sink_guard = self.sink.lock().unwrap();
-            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
-            sink_guard.set_volume(1.0);
-            let mixed_source = UpmixSource::new(hq_source, *self.channel_mode.read().unwrap() as u16, self.is_playing.clone(), self.current_volume.clone());
-            sink_guard.append(mixed_source);
-            sink_guard.play(); 
-        }
-
         self.raw_bytes = Some(raw_bytes.clone());
 
         let session_ref = self.decode_session.clone();
@@ -577,6 +579,27 @@ impl AudioEngine for GalaxyEngine {
                 }
             }
         });
+
+        // ✨ 唯一新加的核心逻辑：在这里乖乖等后台线程跑完再放行
+        debug_log!("Waiting for background full-decode to complete before returning load()...");
+        while !self.is_decoded.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // ✨ 等待完成后，把已经准备好的零拷贝内存源挂上去
+        {
+            let target_channels = *self.channel_mode.read().unwrap() as u16;
+            let mut sink_guard = self.sink.lock().unwrap();
+            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+            sink_guard.set_volume(1.0);
+            
+            if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
+                let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate);
+                sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
+            }
+            
+            sink_guard.play(); 
+        }
 
         Ok(total_duration)
     }

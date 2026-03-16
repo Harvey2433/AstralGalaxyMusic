@@ -21,12 +21,15 @@ const player = usePlayerStore();
           v-for="(track, index) in player.queue" 
           :key="track.id" 
           @dblclick="player.playTrack(track)" 
-          class="flex items-center gap-3 p-3 rounded-lg cursor-pointer group transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+          class="track-item flex items-center gap-3 p-3 rounded-lg cursor-pointer group transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
           :class="player.currentIndex === index && player.hasStarted
             ? 'bg-starlight-cyan/10' 
             : 'hover:bg-white/5'"
         >
-          <img :src="track.cover" class="w-8 h-8 rounded object-cover transition-opacity duration-300"
+          <img :src="track.cover" 
+               loading="lazy" 
+               decoding="async" 
+               class="w-8 h-8 shrink-0 rounded object-cover transition-opacity duration-300"
                :class="player.currentIndex === index && player.hasStarted ? 'opacity-100' : 'opacity-80 group-hover:opacity-100'" />
           
           <div class="flex-1 min-w-0">
@@ -86,4 +89,11 @@ const player = usePlayerStore();
 .animate-wave-1 { animation: local-wave 0.8s infinite ease-in-out; }
 .animate-wave-2 { animation: local-wave 1.1s infinite ease-in-out; }
 .animate-wave-3 { animation: local-wave 0.9s infinite ease-in-out; }
+
+/* ✨ 核心修复：开启内容可见性优化，拯救长列表滚动掉帧 */
+.track-item {
+  content-visibility: auto;
+  contain-intrinsic-size: 56px; /* 告诉浏览器不可见时占多高 (上下 padding 24px + 图片 32px) 防止滚动条乱跳 */
+  will-change: background-color; /* 将 Hover 动画扔给 GPU 硬件加速 */
+}
 </style>
