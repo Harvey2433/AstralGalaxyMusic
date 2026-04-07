@@ -717,33 +717,27 @@ export const usePlayerStore = defineStore('player', () => {
       }
   };
 
-  const seekTo = async (percent: number) => {
-    // 🚀 已剥离 isDownloadingFFmpeg 锁
-    if (isSystemBusy.value || engine.isEngineSwitching.value) return; 
+const seekTo = async (percent: number) => {
+    if (engine.isEngineSwitching.value) return; 
     if (!playlist.currentTrack.value || playlist.currentTrack.value.duration <= 0) return;
-    if (isTrackSwitching.value || isSeeking.value) return; 
 
     const wasPlaying = isPlaying.value && !isPaused.value;
     isSeeking.value = true; 
-    isSystemBusy.value = true;
+    
+    // 绝对禁止在这里写 isSystemBusy.value = true！这是万恶之源！
+    
     const actionSession = ++playActionSession; 
     
     if (wasPlaying) {
         isPlaying.value = false;
         isPaused.value = true;
-        await new Promise<void>(resolve => {
-            smoothVolumeTransition(0.0, 150, async () => {
-                if (actionSession === playActionSession) {
-                    await invoke('player_pause').catch(()=>{});
-                }
-                resolve();
-            });
-        });
+        // 🔥 黑子爆破：把原来那 150ms 的 smoothVolumeTransition 淡出抛弃，直接发暂停指令追求极致 0 延迟！
+        await invoke('player_pause').catch(()=>{});
     } 
     
+    // 如果在你 seek 期间有新的点击进来，旧的直接被抛弃，不再锁死状态
     if (actionSession !== playActionSession) {
         isSeeking.value = false; 
-        isSystemBusy.value = false;
         return;
     }
 
@@ -755,12 +749,13 @@ export const usePlayerStore = defineStore('player', () => {
         await invoke('player_seek', { time: targetTime }); 
     } catch (e) {
     } finally {
-        isSeeking.value = false; 
-        isSystemBusy.value = false;
-        if (wasPlaying && actionSession === playActionSession) {
-            isPlaying.value = true;
-            isPaused.value = false;
-            await executePlayLogic(actionSession, false);
+        if (actionSession === playActionSession) {
+            isSeeking.value = false; 
+            if (wasPlaying) {
+                isPlaying.value = true;
+                isPaused.value = false;
+                await executePlayLogic(actionSession, false);
+            }
         }
     }
   };

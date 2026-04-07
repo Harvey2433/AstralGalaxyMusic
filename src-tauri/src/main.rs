@@ -111,7 +111,7 @@ fn perform_final_save(app: &tauri::AppHandle) {
 }
 
 // ==========================================
-// 🎨 Native Windows SMTC 同步核心
+// Native Windows SMTC 同步核心
 // ==========================================
 #[cfg(target_os = "windows")]
 fn sync_to_windows_smtc_native(hwnd_ptr: isize, title: &str, artist: &str, image_path: Option<String>) -> windows::core::Result<()> {
