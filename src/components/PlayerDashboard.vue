@@ -117,9 +117,6 @@ watch(() => props.showLyrics, (newVal) => {
                   <div class="absolute inset-0 rounded-full border border-starlight-purple/30 scale-105 animate-pulse"></div>
                   <div class="w-64 h-64 rounded-full border-4 border-cosmos-800 shadow-[0_0_50px_rgba(0,0,0,0.5)] overflow-hidden animate-spin-slow" :style="{ animationPlayState: player.isPlaying && !player.isBuffering && !player.isPaused ? 'running' : 'paused' }">
                       <img :src="player.currentTrack?.cover || DEFAULT_COVER" class="w-full h-full object-cover opacity-90 select-none" />
-                      <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-16 h-16 bg-cosmos-950 rounded-full border border-white/10 flex items-center justify-center">
-                          <div class="w-2 h-2 bg-starlight-cyan rounded-full" :class="{ 'animate-ping': player.isPlaying && !player.isBuffering && !player.isPaused }"></div>
-                      </div>
                   </div>
               </div>
               <div class="text-center space-y-2 z-10 mt-12 pointer-events-none">
@@ -130,12 +127,15 @@ watch(() => props.showLyrics, (newVal) => {
       </Transition>
 
       <Transition name="slide-up">
-          <div v-if="showLyrics" class="absolute inset-0 z-30 bg-black/60 backdrop-blur-xl mask-gradient flex flex-col items-center justify-center">
+          <div v-if="showLyrics" 
+               class="absolute inset-0 z-30 mask-gradient flex flex-col items-center justify-center transition-all duration-700"
+               :class="player.isCoverBackgroundEnabled ? 'bg-transparent' : 'bg-black/60 backdrop-blur-xl'">
+               
                <div v-if="lyricsLines.length === 0" class="text-white/20 font-orbitron tracking-widest text-sm animate-pulse">
                   No lyrics found
                </div>
-               <div v-else class="w-full h-full relative overflow-hidden"> 
-                   <div ref="lyricsWrapperRef" class="absolute left-0 w-full flex flex-col items-center gap-6 transition-transform duration-700 cubic-bezier(0.25, 0.46, 0.45, 0.94)" :style="{ transform: `translateY(${scrollOffset}px)`, top: '50%' }">
+               <div v-else class="w-full h-full relative overflow-hidden lyrics-isolation-layer"> 
+                   <div ref="lyricsWrapperRef" class="absolute left-0 w-full flex flex-col items-center gap-6 transition-transform duration-700 ease-[cubic-bezier(0.25,0.46,0.45,0.94)] will-change-transform transform-gpu" :style="{ transform: `translateY(${scrollOffset}px) translateZ(0)`, top: '50%' }">
                        <div v-for="(line, index) in lyricsLines" :key="index" class="lyric-line px-10 py-2 select-none text-center cursor-pointer transition-all duration-500" :class="index === activeLineIndex ? 'active' : (Math.abs(index - activeLineIndex) <= 1 ? 'near' : 'far')" @click.stop="player.seekTo((line.time / player.currentTrack!.duration) * 100)">
                           <span class="kugou-text relative block font-bold font-sans tracking-wider leading-relaxed" :data-text="line.text" :style="index === activeLineIndex ? { '--prog': lineProgress + '%' } : {}">{{ line.text }}</span>
                        </div>
@@ -165,8 +165,25 @@ watch(() => props.showLyrics, (newVal) => {
 
 .kugou-text { color: rgba(255, 255, 255, 0.55); position: relative; z-index: 1; }
 .lyric-line.active .kugou-text { background-image: linear-gradient(to right, #ffffff var(--prog), transparent var(--prog)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.lyric-line.active .kugou-text::after { content: attr(data-text); position: absolute; left: 0; top: 0; z-index: -1; color: rgba(255, 255, 255, 0.55); }
-.lyric-line.active { transform: scale(1.15); filter: drop-shadow(0 0 12px rgba(100, 255, 218, 0.4)); opacity: 1; }
+
+/* 性能优化：非动画阴影 */
+.lyric-line.active .kugou-text::after { 
+  content: attr(data-text); 
+  position: absolute; 
+  left: 0; 
+  top: 0; 
+  z-index: -1; 
+  color: rgba(255, 255, 255, 0.55); 
+  text-shadow: 0 0 16px rgba(100, 255, 218, 0.4); 
+}
+
+.lyric-line.active { transform: scale(1.15); opacity: 1; }
 .lyric-line.near { transform: scale(0.95); opacity: 0.8; }
 .lyric-line.far { transform: scale(0.85); opacity: 0.4; }
+
+/* GPU 硬件加速层隔离 */
+.lyrics-isolation-layer {
+  contain: strict;
+  transform: translateZ(0);
+}
 </style>

@@ -825,14 +825,24 @@ const seekTo = async (percent: number) => {
   let rafId: number | null = null;
   let lastFrameTime = 0;
 
+  // 修复：在这里加入 FPS 节流，稳定限制在最高 60 FPS
   const startProgressLoop = () => {
     stopProgressLoop();
     lastFrameTime = performance.now();
     
+    // 这里的 loop 是我新定义的内部函数，timestamp 是浏览器原生 API 自动传给它的！
     const loop = (timestamp: number) => {
       if (!isPlaying.value || isPaused.value) return; 
       
-      const deltaTime = (timestamp - lastFrameTime) / 1000; 
+      const elapsed = timestamp - lastFrameTime;
+      
+      // 拦截器：如果距离上一帧还不到 16.6ms (60FPS)，就跳过
+      if (elapsed < 16.6) {
+          rafId = requestAnimationFrame(loop);
+          return;
+      }
+      
+      const deltaTime = elapsed / 1000; 
       lastFrameTime = timestamp;
       
       if (!isDragging.value && !isBuffering.value && !isSeeking.value && !isSystemBusy.value && playlist.currentTrack.value) {
@@ -857,7 +867,7 @@ const seekTo = async (percent: number) => {
   };
 
   watch(volume, (v) => { 
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
+      // 已剥离 isDownloadingFFmpeg 锁
       if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
 
       const target = v / 100.0;

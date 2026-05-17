@@ -7,6 +7,9 @@ export function useEngine() {
     const ffmpegProgress = ref(0);
     const isSmtcEnabled = ref(JSON.parse(localStorage.getItem('smtc_enabled') || 'true'));
     
+    // ✨ 新增：动态封面背景设置开关
+    const isCoverBackgroundEnabled = ref(JSON.parse(localStorage.getItem('cover_bg') || 'true'));
+    
     const isEngineSwitching = ref(false);
     const hasAudioInitialized = ref(false);
     const engineCoolingRemaining = ref(0);
@@ -29,7 +32,7 @@ export function useEngine() {
     };
 
     return { 
-        activeEngine, isDownloadingFFmpeg, ffmpegProgress, isSmtcEnabled, 
+        activeEngine, isDownloadingFFmpeg, ffmpegProgress, isSmtcEnabled, isCoverBackgroundEnabled,
         isEngineSwitching, hasAudioInitialized, engineCoolingRemaining, 
         lastEngineSwitchTime, lastMixerActionTime, channelMode, isTrueSurround, 
         availableDevices, activeDevice, fetchDevices 

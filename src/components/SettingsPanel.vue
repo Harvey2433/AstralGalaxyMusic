@@ -14,7 +14,6 @@ const activeSettingTab = ref('core');
 const engineState = ref<'idle' | 'switching' | 'success' | 'failed'>('idle');
 const targetEngineId = ref(''); 
 
-// 修复：自定义下拉框状态
 const isDeviceDropdownOpen = ref(false);
 
 const engines = [
@@ -49,39 +48,23 @@ const setChannel = async (ch: number) => {
         emit('notify', 'System busy: Engine locked', 'error');
         return;
     }
-
     const res = await player.setChannelMode(ch); 
-    if (res === 'SUCCESS') {
-        emit('notify', `Audio output: ${ch === 2 ? 'Stereo' : ch.toFixed(1) + ' Surround'}`); 
-    }
+    if (res === 'SUCCESS') { emit('notify', `Audio output: ${ch === 2 ? 'Stereo' : ch.toFixed(1) + ' Surround'}`); }
 };
 
-// 修复：改进的设备选择逻辑
 const selectOutputDevice = async (deviceName: string) => { 
     if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
-        emit('notify', 'System busy: Engine locked', 'error');
-        return;
+        emit('notify', 'System busy: Engine locked', 'error'); return;
     }
-
     const res = await player.setOutputDevice(deviceName); 
-    if (res === 'SUCCESS') {
-        emit('notify', `Output: ${deviceName}`);
-        isDeviceDropdownOpen.value = false;
-    }
+    if (res === 'SUCCESS') { emit('notify', `Output: ${deviceName}`); isDeviceDropdownOpen.value = false; }
 };
 
 const toggleTrueSurround = async () => {
     if (player.channelMode === 2) return; 
-    
-    if (player.isEngineSwitching || player.isDownloadingFFmpeg) {
-        emit('notify', 'System busy: Engine locked', 'error');
-        return;
-    }
-
+    if (player.isEngineSwitching || player.isDownloadingFFmpeg) { emit('notify', 'System busy: Engine locked', 'error'); return; }
     const res = await player.toggleTrueSurround();
-    if (res === 'SUCCESS') {
-        emit('notify', player.isTrueSurround ? 'True surround enabled' : 'Virtual surround enabled');
-    }
+    if (res === 'SUCCESS') { emit('notify', player.isTrueSurround ? 'True surround enabled' : 'Virtual surround enabled'); }
 };
 
 const toggleSMTC = () => {
@@ -90,25 +73,28 @@ const toggleSMTC = () => {
     emit('notify', player.isSmtcEnabled ? 'Native SMTC enabled' : 'Native SMTC disabled');
 };
 
-// 修复：自动刷新设备列表
+const toggleCoverBackground = () => {
+    player.isCoverBackgroundEnabled = !player.isCoverBackgroundEnabled;
+    localStorage.setItem('cover_bg', JSON.stringify(player.isCoverBackgroundEnabled));
+    emit('notify', player.isCoverBackgroundEnabled ? 'Dynamic cover background enabled' : 'Dynamic cover background disabled');
+};
+
 let deviceUpdateTimer: any = null;
 onMounted(() => {
     player.fetchDevices();
-    deviceUpdateTimer = setInterval(() => {
-        player.fetchDevices();
-    }, 5000);
+    deviceUpdateTimer = setInterval(() => { player.fetchDevices(); }, 5000);
 });
 
-onUnmounted(() => {
-    if (deviceUpdateTimer) clearInterval(deviceUpdateTimer);
-});
+onUnmounted(() => { if (deviceUpdateTimer) clearInterval(deviceUpdateTimer); });
 </script>
 
 <template>
   <Transition name="panel-fade">
-    <div class="absolute inset-0 z-30 flex bg-cosmos-950/80 backdrop-blur-xl">
+    <div class="absolute inset-0 z-30 flex transition-colors duration-700"
+         :class="player.isCoverBackgroundEnabled ? 'bg-black/50 backdrop-blur-2xl' : 'bg-cosmos-950/80 backdrop-blur-xl'">
       
-      <div class="w-64 h-full bg-black/40 flex flex-col p-6 z-20 border-r border-white/5 shadow-[10px_0_30px_rgba(0,0,0,0.5)] shrink-0">
+      <div class="w-64 h-full flex flex-col p-6 z-20 border-r border-white/5 shadow-[10px_0_30px_rgba(0,0,0,0.5)] shrink-0 transition-colors duration-700"
+           :class="player.isCoverBackgroundEnabled ? 'bg-black/10' : 'bg-black/40'">
         <h2 class="text-xl font-orbitron font-bold text-white mb-8 flex items-center gap-2"><Settings :size="20" class="text-starlight-purple"/> SETTINGS</h2>
         <nav class="space-y-2 flex-1">
           <button @click="activeSettingTab = 'core'" class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] text-sm font-bold tracking-wider active:scale-95 no-drag-btn no-outline" :class="activeSettingTab === 'core' ? 'bg-starlight-cyan/15 text-starlight-cyan shadow-[0_4px_15px_rgba(100,255,218,0.1)]' : 'text-white/40 hover:text-white hover:bg-white/10'"><Terminal :size="18" /> CORE SYSTEM</button>
@@ -122,7 +108,7 @@ onUnmounted(() => {
         <Transition name="slide-up-fade" mode="out-in">
           
           <div v-if="activeSettingTab === 'core'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10 flex flex-col items-center justify-center">
-            <div class="w-full max-w-3xl">
+             <div class="w-full max-w-3xl">
                 <div class="mb-8 flex items-end justify-between">
                     <div><h3 class="text-2xl font-bold text-white mb-2">Decoding Engine</h3><p class="text-sm text-white/40">Select the audio core driver for signal processing.</p></div>
                     <div class="flex items-center gap-2 bg-black/40 p-2 px-3 rounded-lg border border-white/5"><Activity :size="14" class="text-starlight-cyan" /><span class="text-xs font-mono text-starlight-cyan/80">LATENCY: NORMAL</span></div>
@@ -160,7 +146,7 @@ onUnmounted(() => {
           </div>
           
           <div v-else-if="activeSettingTab === 'audio'" class="absolute inset-0 overflow-y-auto scrollbar-hide p-10 flex flex-col items-center justify-center">
-              <div class="w-full max-w-3xl">
+             <div class="w-full max-w-3xl">
                   <h3 class="text-2xl font-bold text-white mb-2">Audio Channels</h3>
                   <p class="text-sm text-white/40 mb-8">Configure output mapping for surround sound systems.</p>
 
@@ -221,7 +207,7 @@ onUnmounted(() => {
                    <h3 class="text-2xl font-bold text-white mb-2">Hologram UI & System Integration</h3>
                    <p class="text-sm text-white/40 mb-8">Configure system-level UI integrations and display features.</p>
                    
-                   <div class="mb-6 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20 flex items-center justify-between">
+                   <div class="mb-4 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20 flex items-center justify-between">
                       <div>
                           <h4 class="text-white font-bold tracking-widest text-sm">NATIVE WINDOWS SMTC</h4>
                           <p class="text-[10px] text-white/40 mt-1 uppercase">Sync track metadata to system media overlay.</p>
@@ -233,6 +219,21 @@ onUnmounted(() => {
                       >
                           <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all duration-500"
                                :class="player.isSmtcEnabled ? 'left-7' : 'left-1'"></div>
+                      </button>
+                  </div>
+
+                  <div class="mb-6 p-5 bg-white/5 rounded-2xl border border-white/5 transition-all duration-400 hover:border-white/20 flex items-center justify-between">
+                      <div>
+                          <h4 class="text-white font-bold tracking-widest text-sm">DYNAMIC COVER BACKGROUND</h4>
+                          <p class="text-[10px] text-white/40 mt-1 uppercase">[Beta] Use album cover as full-screen background.</p>
+                      </div>
+                      <button 
+                          @click="toggleCoverBackground"
+                          class="w-12 h-6 rounded-full transition-all duration-500 relative no-drag-btn outline-none"
+                          :class="player.isCoverBackgroundEnabled ? 'bg-starlight-cyan' : 'bg-white/10'"
+                      >
+                          <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all duration-500"
+                               :class="player.isCoverBackgroundEnabled ? 'left-7' : 'left-1'"></div>
                       </button>
                   </div>
 

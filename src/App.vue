@@ -115,16 +115,13 @@ onMounted(() => {
         listen('smtc-next', () => player.nextTrack()),
         listen('smtc-prev', () => player.prevTrack()),
         
-        // 终极修补：以后端硬件信号驱动前端总线锁
         listen('force-pause', () => { 
-            // 立即开启“灵动岛”Process拦截，防止用户在自动切换时乱点
             player.isSystemBusy = true;
             player.isBuffering = true;
             if (player.isPlaying) player.togglePlay(); 
         }),
         
         listen('force-play', () => { 
-            // 硬件迁移完成，释放总线锁
             player.isSystemBusy = false;
             player.isBuffering = false;
             if (!player.isPlaying) player.togglePlay(); 
@@ -145,12 +142,35 @@ onMounted(() => {
   <main class="relative flex w-screen h-screen overflow-hidden text-cosmos-100 bg-[#05080a] font-sans rounded-xl border border-white/10">
     <TheIsland ref="islandRef" />
 
-    <div class="absolute top-[-15%] right-[-10%] w-[600px] h-[600px] rounded-full pointer-events-none z-0 animate-float-slow opacity-70" 
-      style="background: radial-gradient(circle at 30% 30%, rgba(189, 52, 254, 0.4) 0%, rgba(80, 20, 120, 0.1) 60%, transparent 100%); box-shadow: inset -20px -20px 50px rgba(0,0,0,0.5); filter: blur(40px);"></div>
-    <div class="absolute bottom-[-20%] left-[-15%] w-[700px] h-[700px] rounded-full pointer-events-none z-0 animate-float-slower opacity-60" 
-      style="background: radial-gradient(circle at 70% 30%, rgba(100, 255, 218, 0.3) 0%, rgba(20, 120, 100, 0.05) 60%, transparent 100%); box-shadow: inset 20px 20px 50px rgba(0,0,0,0.5); filter: blur(50px);"></div>
-    <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] opacity-20 mix-blend-overlay pointer-events-none z-0"></div>
+    <div class="absolute inset-0 pointer-events-none z-0 overflow-hidden bg-[#05080a]">
+        
+        <TransitionGroup name="bg-fade" tag="div" class="absolute inset-0 w-full h-full">
+            <img v-if="player.isCoverBackgroundEnabled"
+                 :key="player.currentTrack?.cover || 'DEFAULT_BG'"
+                 :src="player.currentTrack?.cover || 'https://picui.ogmua.cn/s1/2026/03/09/69aeb0db3989e.webp'"
+                 class="absolute inset-0 w-full h-full object-cover object-left-top opacity-50 0 will-change-[opacity] transform-gpu"
+                 alt="Dynamic Cover Background" />
+        </TransitionGroup>
 
+        <div v-if="player.isCoverBackgroundEnabled" 
+             class="absolute inset-0 backdrop-blur-[35px] saturate-[1.5] pointer-events-none z-10" 
+             style="transform: translateZ(0); backface-visibility: hidden;">
+        </div>
+
+        <Transition name="bg-fade">
+            <div v-if="!player.isCoverBackgroundEnabled" class="absolute inset-0 w-full h-full">
+                <div class="absolute top-[-15%] right-[-10%] w-[600px] h-[600px] rounded-full pointer-events-none z-0 animate-float-slow opacity-70 will-change-transform transform-gpu" 
+                  style="background: radial-gradient(circle at 30% 30%, rgba(189, 52, 254, 0.4) 0%, rgba(80, 20, 120, 0.1) 60%, transparent 100%); box-shadow: inset -20px -20px 50px rgba(0,0,0,0.5); filter: blur(40px); transform: translateZ(0);"
+                  :style="{ animationPlayState: player.isPlaying && !player.isPaused ? 'running' : 'paused' }"></div>
+                
+                <div class="absolute bottom-[-20%] left-[-15%] w-[700px] h-[700px] rounded-full pointer-events-none z-0 animate-float-slower opacity-60 will-change-transform transform-gpu" 
+                  style="background: radial-gradient(circle at 70% 30%, rgba(100, 255, 218, 0.3) 0%, rgba(20, 120, 100, 0.05) 60%, transparent 100%); box-shadow: inset 20px 20px 50px rgba(0,0,0,0.5); filter: blur(50px); transform: translateZ(0);"
+                  :style="{ animationPlayState: player.isPlaying && !player.isPaused ? 'running' : 'paused' }"></div>
+            </div>
+        </Transition>
+
+        <div class="absolute inset-0 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] opacity-20 pointer-events-none z-0"></div>
+    </div>
     <div class="relative z-10 flex w-full h-full backdrop-blur-[1px]">
       <SideNavigation :activeTab="activeTab" @switch="switchTab" />
 
@@ -173,32 +193,32 @@ onMounted(() => {
         <div class="flex-1 relative overflow-hidden w-full">
           <Transition name="page-spring">
               <div v-if="activeTab === 'likes'" class="absolute inset-0 z-20 flex flex-col p-10 overflow-y-auto scrollbar-hide">
-                 <h2 class="text-4xl font-bold font-orbitron text-white mb-8 flex items-center gap-4"><Heart :size="32" class="text-red-500 fill-red-500" /> LIKED TRACKS</h2>
-                 <div class="grid grid-cols-1 gap-2">
+                <h2 class="text-4xl font-bold font-orbitron text-white mb-8 flex items-center gap-4"><Heart :size="32" class="text-red-500 fill-red-500" /> LIKED TRACKS</h2>
+                <div class="grid grid-cols-1 gap-2">
                     <div v-for="track in player.likedQueue" :key="track.id" @dblclick="player.playTrack(track)" 
-                         class="flex items-center gap-4 p-4 rounded-xl bg-white/5 hover:bg-white/10 active:scale-[0.98] transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] group cursor-pointer">
-                       <div class="relative w-12 h-12 rounded-lg overflow-hidden">
+                        class="flex items-center gap-4 p-4 rounded-xl bg-white/5 hover:bg-white/10 active:scale-[0.98] transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] group cursor-pointer">
+                      <div class="relative w-12 h-12 rounded-lg overflow-hidden">
                           <img :src="track.cover" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
                           <div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all duration-300">
-                             <Play :size="20" class="text-white fill-white transition-transform duration-300 active:scale-75"/>
+                            <Play :size="20" class="text-white fill-white transition-transform duration-300 active:scale-75"/>
                           </div>
-                       </div>
-                       <div class="flex-1">
-                         <div class="text-white font-bold">{{ track.title }}</div>
-                         <div class="text-white/40 text-xs">{{ track.artist }}</div>
-                       </div>
-                       <button @click.stop="player.toggleLike(track)" class="text-red-500 hover:scale-125 active:scale-75 transition-all duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)]">
-                         <Heart :size="20" :class="player.isLiked(track) ? 'fill-red-500' : ''" />
-                       </button>
+                      </div>
+                      <div class="flex-1">
+                        <div class="text-white font-bold">{{ track.title }}</div>
+                        <div class="text-white/40 text-xs">{{ track.artist }}</div>
+                      </div>
+                      <button @click.stop="player.toggleLike(track)" class="text-red-500 hover:scale-125 active:scale-75 transition-all duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)]">
+                        <Heart :size="20" :class="player.isLiked(track) ? 'fill-red-500' : ''" />
+                      </button>
                     </div>
                     <div v-if="player.likedQueue.length === 0" class="text-white/30 text-center mt-20 font-orbitron tracking-widest">EMPTY_VAULT</div>
-                 </div>
+                </div>
               </div>
           </Transition>
 
           <div v-show="activeTab === 'dashboard' || activeTab === 'settings'" 
-               class="absolute inset-0 z-20 transition-all duration-700 ease-[cubic-bezier(0.2,0.8,0.2,1)]" 
-               :class="showSettings ? 'opacity-0 scale-95 pointer-events-none blur-md' : 'opacity-100 scale-100 blur-0'">
+              class="absolute inset-0 z-20 transition-all duration-700 ease-[cubic-bezier(0.2,0.8,0.2,1)]" 
+              :class="showSettings ? 'opacity-0 scale-95 pointer-events-none blur-md' : 'opacity-100 scale-100 blur-0'">
             <PlayerDashboard :showLyrics="showLyrics" />
           </div>
 
@@ -231,6 +251,16 @@ onMounted(() => {
 </template>
 
 <style>
+/* ✨ 交叉淡出专属平滑过渡效果 (PPT级别切歌动画) */
+.bg-fade-enter-active,
+.bg-fade-leave-active {
+  transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.bg-fade-enter-from,
+.bg-fade-leave-to {
+  opacity: 0;
+}
+
 /* 基础封印与全局字体设置 */
 html { 
   font-size: 16px !important; 

@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{Window, Emitter, Manager}; 
 use zip::ZipArchive;
-use rodio::{OutputStreamHandle, Sink, Source, buffer::SamplesBuffer};
+use rodio::{OutputStreamHandle, Sink, Source};
 use rodio::cpal::traits::{HostTrait, DeviceTrait};
 
 #[cfg(target_os = "windows")]
@@ -230,7 +230,7 @@ impl AudioEngine for FFmpegEngine {
         self.fade_token.fetch_add(1, Ordering::SeqCst);
 
         let target_channels = *self.channel_mode.read().unwrap() as u16;
-        let buffer = SamplesBuffer::new(2, target_sr, samples_arc.to_vec());
+        let buffer = super::galaxy::ArcSliceSource::new(samples_arc.clone(), 2, target_sr);
         let duration = buffer.total_duration().unwrap_or(Duration::from_secs(0)).as_secs_f64();
 
         let mut sink_guard = self.sink.lock().unwrap();
@@ -302,7 +302,7 @@ impl AudioEngine for FFmpegEngine {
         }
         let target_channels = *self.channel_mode.read().unwrap() as u16;
         if let Some(samples_arc) = &self.current_samples {
-             let source = SamplesBuffer::new(2, self.sample_rate, samples_arc.to_vec()).skip_duration(Duration::from_secs_f64(time));
+             let source = super::galaxy::ArcSliceSource::new(samples_arc.clone(), 2, self.sample_rate).skip_duration(Duration::from_secs_f64(time));
              let sink_guard = self.sink.lock().unwrap();
              sink_guard.set_volume(1.0);
              sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));

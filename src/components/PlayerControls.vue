@@ -21,16 +21,12 @@ const VolumeIcon = computed(() => {
   return Volume2; 
 });
 
-// --- 🛠️ 核心 Bug 修复：音量更新逻辑 ---
-
 const handleVolumeUpdate = (e: PointerEvent) => {
-  // 增加硬拦截：解码中禁止任何音量更新操作
   if (player.isSeeking || player.isBuffering) return;
   if (!volumeBarRef.value) return;
   const rect = volumeBarRef.value.getBoundingClientRect();
   let percent = ((e.clientX - rect.left) / rect.width) * 100;
   percent = Math.max(0, Math.min(100, percent));
-  // 调用带拦截器的 store 方法
   player.setVolume(percent);
 };
 
@@ -52,7 +48,6 @@ const onPointerUp = (e: PointerEvent) => {
 };
 
 const startVolumeDrag = (e: PointerEvent) => { 
-  // 增加硬拦截：解码中禁止开始拖拽
   if (player.isSeeking || player.isBuffering) return;
   if (!volumeBarRef.value) return;
   e.preventDefault();
@@ -89,14 +84,15 @@ const onProgressRelease = () => {
 </script>
 
 <template>
-  <div class="h-28 px-8 pb-4 bg-gradient-to-t from-cosmos-950 via-cosmos-900/90 to-transparent flex flex-col justify-end relative z-40">
+  <div class="h-28 px-8 pb-4 flex flex-col justify-end relative z-40 transition-colors duration-1000 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+       :class="player.isCoverBackgroundEnabled ? 'bg-gradient-to-t from-black/60 via-black/20 to-transparent' : 'bg-gradient-to-t from-cosmos-950 via-cosmos-900/90 to-transparent'">
     
     <div class="w-full h-6 mb-4 flex items-center cursor-default group relative no-drag-btn hover:scale-[1.005] transition-transform duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
          :class="{ 'pointer-events-none opacity-80': player.isSeeking || player.isBuffering }">
-       <div class="absolute w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none">
-          <div class="absolute h-full top-0 left-0 bg-gradient-to-r from-starlight-purple to-starlight-cyan transition duration-100"
+       <div class="absolute w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none transform-gpu">
+          <div class="absolute h-full top-0 left-0 w-full bg-gradient-to-r from-starlight-purple to-starlight-cyan transition-none origin-left will-change-transform"
                :class="player.isBuffering || player.isSeeking ? 'animate-pulse opacity-50' : ''"
-               :style="{ width: (player.isDragging ? localProgress : player.progress) + '%' }">
+               :style="{ transform: `scaleX(${(player.isDragging ? localProgress : player.progress) / 100})` }">
           </div>
        </div>
        <input type="range" min="0" max="100" step="0.1" 
@@ -154,8 +150,8 @@ const onProgressRelease = () => {
           style="touch-action: none;" 
           @pointerdown="startVolumeDrag"
         >
-          <div class="w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none">
-            <div class="h-full bg-starlight-cyan transition-none" :style="{ width: player.volume + '%' }"></div>
+          <div class="w-full h-1 bg-white/10 rounded-full overflow-hidden pointer-events-none transform-gpu">
+            <div class="h-full w-full bg-starlight-cyan transition-none origin-left will-change-transform" :style="{ transform: `scaleX(${player.volume / 100})` }"></div>
           </div>
           
           <div 

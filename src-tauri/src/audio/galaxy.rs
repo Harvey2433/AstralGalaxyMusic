@@ -18,7 +18,7 @@ macro_rules! debug_log {
 }
 
 // =================================================================
-// ⏱️ 全局高精度原子时钟基准 (Lock-Free Epoch)
+// 全局高精度原子时钟基准 (Lock-Free Epoch)
 // =================================================================
 static TIME_EPOCH: OnceLock<Instant> = OnceLock::new();
 #[inline(always)]
