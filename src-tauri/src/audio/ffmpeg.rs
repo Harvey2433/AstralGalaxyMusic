@@ -181,9 +181,15 @@ impl AudioEngine for FFmpegEngine {
         println!("\x1b[36m[FFMPEG] Audio Engine Decoder Initialized: Target SR = {}Hz, Channels = 2\x1b[0m", target_sr);
         
         let mut cmd = Command::new(&ffmpeg_exe);
+        // 内置参数再优化
+        //cmd.args(&[
+        //    "-i", path, "-f", "f32le", "-ac", "2", "-ar", &target_sr.to_string(), 
+        //    "-af", "aresample=resampler=soxr:precision=28:cheby=1:dither_method=triangular,alimiter=limit=0.99:attack=1:release=20:asc=0",
+        //    "-vn", "-sn", "-map_metadata", "-1", "-v", "error", "pipe:1"
+        //])
         cmd.args(&[
             "-i", path, "-f", "f32le", "-ac", "2", "-ar", &target_sr.to_string(), 
-            "-af", "aresample=resampler=soxr:precision=28:cheby=1:dither_method=triangular,alimiter=limit=0.99:attack=1:release=20:asc=0",
+            "-af", "aresample=resampler=soxr:precision=28:dither_method=triangular",
             "-vn", "-sn", "-map_metadata", "-1", "-v", "error", "pipe:1"
         ])
         .stdout(Stdio::piped())

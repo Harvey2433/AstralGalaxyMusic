@@ -103,7 +103,7 @@ pub mod mmcss {
 }
 
 // =================================================================
-// 🚀 发烧级 Rubato Sinc 重采样器
+// Rubato Sinc 重采样器
 // =================================================================
 pub struct RubatoSource<I: Source<Item = f32>> {
     input: I,
@@ -192,9 +192,12 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         for i in 0..valid_out_frames.min(out_frames) {
             for ch in 0..self.channels {
                 let mut sample = out_buffers[ch][i];
-                if sample.abs() > 0.95 {
-                    let overshoot = sample.abs() - 0.95;
-                    sample = sample.signum() * (0.95 + overshoot * 0.5);
+                //if sample.abs() > 0.95 {
+                //    let overshoot = sample.abs() - 0.95;
+                //    sample = sample.signum() * (0.95 + overshoot * 0.5);
+                //}
+                if sample.abs() > 0.999 {
+                    sample = sample.signum() * 0.999;
                 }
                 self.output_buffer.push(sample);
             }
@@ -336,17 +339,25 @@ impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
             let raw_r = if self.input.channels() == 1 { raw_l } else { self.input.next().unwrap_or(raw_l) };
             if self.input.channels() > 2 { for _ in 2..self.input.channels() { let _ = self.input.next(); } }
 
-            let l = raw_l - self.prev_l + 0.995 * self.dc_l;
-            let r = raw_r - self.prev_r + 0.995 * self.dc_r;
+            //let l = raw_l - self.prev_l + 0.995 * self.dc_l;
+            //let r = raw_r - self.prev_r + 0.995 * self.dc_r;
+            let l = raw_l;
+            let r = raw_r;
             self.dc_l = l; self.dc_r = r;
             self.prev_l = raw_l; self.prev_r = raw_r;
-
+            // 移除stereo直通路径软限幅
+            // if self.target_channels == 2 && !self.virtualize {
+            //     self.current_frame.push(Self::audiophile_limiter(r * final_gain));
+            //     self.current_frame.push(Self::audiophile_limiter(l * final_gain));
+            //     return self.current_frame.pop();
+            // }
+            
             if self.target_channels == 2 && !self.virtualize {
-                self.current_frame.push(Self::audiophile_limiter(r * final_gain));
-                self.current_frame.push(Self::audiophile_limiter(l * final_gain));
+                self.current_frame.push(r * final_gain);
+                self.current_frame.push(l * final_gain);
                 return self.current_frame.pop();
             }
-            
+
             let (lfe_raw, rear_l_raw, rear_r_raw) = self.dsp.process(l, r);
             let center = (l + r) * 0.5;
             
@@ -575,7 +586,7 @@ impl AudioEngine for GalaxyEngine {
                 if session_ref.load(Ordering::SeqCst) == my_session {
                     *samples_ref.write().unwrap() = Some(Arc::new(pcm_buffer));
                     is_decoded_ref.store(true, Ordering::Release);
-                    debug_log!("Background full-decode complete. Ready for True O(1) instant seek.");
+                    debug_log!("Background full-decode complete.");
                 }
             }
         });

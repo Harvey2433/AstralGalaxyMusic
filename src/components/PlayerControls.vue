@@ -171,4 +171,4 @@ const onProgressRelease = () => {
 <style scoped>
 .no-drag-btn { -webkit-app-region: no-drag; }
 .transition-none { transition: none !important; }
-</style>
+</style>  

@@ -153,7 +153,7 @@ onMounted(() => {
         </TransitionGroup>
 
         <div v-if="player.isCoverBackgroundEnabled" 
-             class="absolute inset-0 backdrop-blur-[35px] saturate-[1.5] pointer-events-none z-10" 
+             class="absolute inset-0 backdrop-blur-[025px] saturate-[1.5] pointer-events-none z-10" 
              style="transform: translateZ(0); backface-visibility: hidden;">
         </div>
 
