@@ -1,33 +1,12 @@
-# AstralGalaxyMusicPlayer 星寰音乐播放器
+# AstralGalaxyMusicPlayer
 
-## 1. 项目概述
-AstralGalaxyMusicPlayer 是一款基于 Rust 语言与 Tauri 框架开发的高保真音频播放系统。项目旨在优化 Windows 平台的音频调度逻辑，利用自研的 Galaxy DSP 引擎实现 $O(1)$ 复杂度的非线性音频寻道与回放。
+## 1. 部署与构建说明
 
-## 2. 核心技术架构
-
-### 2.1 Galaxy Adaptive Sync 内存管理模型
-系统针对音频流处理构建了零拷贝（Zero-copy）内存管理模型。 通过 Rust 语言的底层所有权机制与并发原语，确保了解码缓冲区与硬件输出抽象层之间的高精度同步。
-
-### 2.2 MMCSS 线程优先级提权逻辑
-为保证音频处理在复杂系统环境下的实时性，后端集成了 Windows 多媒体类调度程序服务（MMCSS）。 该机制将音频处理线程提升至系统级高执行优先级，有效降低了 CPU 高负载波动产生的缓冲区抖动风险。
-
-### 2.3 信号处理链
-* **解码层**: 深度集成 FFmpeg soxr-VHQ 重采样算法，提供工业级的信号转换精度。
-* **状态机**: Rust 后端采用 Actor 模型维护播放状态，处理来自前端 IPC 通道的异步调度请求。
-* **系统集成**: 原生适配 Windows 系统媒体传输控件（SMTC），实现音频元数据与硬件媒体按键的底层交互。
-
-## 3. 关键性能指标
-
-### 3.1 瞬时寻道机制
-不同于传统的线性解码寻道模式，本引擎通过预处理内存映射策略，实现了在音频缓存内的瞬时定位，消除了连续跳转时的解码重算延迟。
-
-## 4. 部署与构建说明
-
-### 4.1 运行环境要求
+### 1.1 运行环境要求
 * 操作系统: Windows 10/11 (x64)。
 * 运行库: Microsoft Edge WebView2 运行时。
 
-### 4.2 构建指令
+### 1.2 构建指令
 项目采用标准 Tauri 构建管线，生产环境发布指令如下：
 ```bash
 # 安装依赖
@@ -36,10 +15,10 @@ npm install
 # 执行生产环境构建
 npm run tauri build
 ```
-## 5.版权与许可声明 (License and Copyright)
+## 2.版权与许可声明 (License and Copyright)
 
-### 1. 许可协议
-本项目源代码遵循 **GNU General Public License v3.0 (GPL v3.0)** 协议进行托管与授权。任何个人或实体在获取、修改及再分发本系统源代码时，必须严格遵守该协议之各项条款，包括但不限于要求所有衍生作品必须以相同协议开源。
+### 2.1 许可协议
+此项目采用 [GNU General Public License v3.0 (GPL-3.0)](https://www.gnu.org/licenses/gpl-3.0.txt) 协议., 详见项目根目录下的 [LICENSE](./LICENSE) 文件.
 
 ---
 Copyright 2026 Maple Bamboo Team. All rights reserved.
