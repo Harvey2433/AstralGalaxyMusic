@@ -8,6 +8,8 @@ use std::sync::mpsc::{self, Sender};
 use rodio::{OutputStream, OutputStreamHandle};
 use rodio::cpal::traits::{HostTrait, DeviceTrait};
 
+use crate::modules::utils::validate_audio_file;
+
 // Wrapper 强制实现 Send/Sync
 struct StreamHolder(OutputStream);
 unsafe impl Send for StreamHolder {}
@@ -55,7 +57,31 @@ impl AudioManager {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
         
         std::thread::spawn(move || {
-            let mut manager = AudioManager::new();
+            // 🛡️ 安全初始化：如果音频子系统无法启动，进入降级模式而非abort
+            let mut manager = match AudioManager::try_new() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[AUDIO FATAL] AudioManager initialization failed: {}. Entering degraded mode.", e);
+                    // 降级模式：消费所有命令并返回错误，防止发送端永久阻塞
+                    while let Ok(cmd) = rx.recv() {
+                        match cmd {
+                            AudioCommand::Load(_, reply) => { let _ = reply.send(Err(format!("Audio subsystem unavailable: {}", e))); }
+                            AudioCommand::Play => {}
+                            AudioCommand::Pause => {}
+                            AudioCommand::Seek(_, reply) => { let _ = reply.send(()); }
+                            AudioCommand::SetVolume(_) => {}
+                            AudioCommand::SetChannels(_) => {}
+                            AudioCommand::GetDevices(reply) => { let _ = reply.send(vec![]); }
+                            AudioCommand::SetDevice(_, reply) => { let _ = reply.send(Err("Audio subsystem unavailable".into())); }
+                            AudioCommand::SwitchEngine(_, reply) => { let _ = reply.send(Err("Audio subsystem unavailable".into())); }
+                            AudioCommand::GetCurrentEngine(reply) => { let _ = reply.send("Unavailable".into()); }
+                            AudioCommand::CheckDeviceStatus(reply) => { let _ = reply.send(None); }
+                            AudioCommand::GetCurrentTime(reply) => { let _ = reply.send(0.0); }
+                        }
+                    }
+                    return;
+                }
+            };
             
             while let Ok(cmd) = rx.recv() {
                 match cmd {
@@ -78,23 +104,30 @@ impl AudioManager {
         tx
     }
 
-    pub fn new() -> Self {
+    /// 安全构造：返回 Result 而非 panic
+    fn try_new() -> Result<Self, String> {
         let host = rodio::cpal::default_host();
         let default_name = host.default_output_device()
             .and_then(|d| d.name().ok())
             .unwrap_or_else(|| "Unknown".to_string());
 
-        let (stream, stream_handle) = OutputStream::try_default().unwrap();
-        let default_engine = galaxy::GalaxyEngine::new(stream_handle.clone());
+        let (stream, stream_handle) = OutputStream::try_default()
+            .map_err(|e| format!("Failed to open default audio output: {}", e))?;
+        let default_engine = galaxy::GalaxyEngine::try_new(stream_handle.clone())
+            .map_err(|e| format!("Failed to create default engine: {}", e))?;
         
-        Self {
+        Ok(Self {
             active_engine: Box::new(default_engine),
             _stream: Some(StreamHolder(stream)),
             stream_handle,
             current_device_mode: "Default".to_string(),
             last_resolved_default: default_name,
             current_volume: 0.8, // 新增：初始化默认音量为 80%
-        }
+        })
+    }
+
+    pub fn new() -> Self {
+        Self::try_new().expect("[AUDIO] Cannot initialize audio subsystem - no audio device available")
     }
 
     pub fn check_device_status(&mut self) -> Option<String> {
@@ -191,11 +224,15 @@ impl AudioManager {
         self.check_and_recover_default_device();
         let res = match engine_id {
             "galaxy" => {
-                self.active_engine = Box::new(galaxy::GalaxyEngine::new(self.stream_handle.clone()));
+                let engine = galaxy::GalaxyEngine::try_new(self.stream_handle.clone())
+                    .map_err(|e| format!("ENGINE_INIT_FAILED: {}", e))?;
+                self.active_engine = Box::new(engine);
                 Ok("ENGINE_GALAXY_READY".to_string())
             }
             "ffmpeg" => {
-                self.active_engine = Box::new(ffmpeg::FFmpegEngine::new(self.stream_handle.clone()));
+                let engine = ffmpeg::FFmpegEngine::try_new(self.stream_handle.clone())
+                    .map_err(|e| format!("ENGINE_INIT_FAILED: {}", e))?;
+                self.active_engine = Box::new(engine);
                 Ok("ENGINE_FFMPEG_READY".to_string())
             }
             _ => Err("UNKNOWN_ENGINE".to_string())
@@ -210,6 +247,9 @@ impl AudioManager {
     }
 
     pub fn load(&mut self, path: &str) -> Result<f64, String> { 
+        // 🛡️ 音频文件合法性预检：在进入解码器前拦截伪装/损坏文件
+        validate_audio_file(path)?;
+        
         self.check_and_recover_default_device();
         self.active_engine.load(path) 
     }

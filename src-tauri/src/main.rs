@@ -92,12 +92,13 @@ async fn load_astral_data(app: tauri::AppHandle) -> Result<AstralData, String> {
 
 #[tauri::command]
 fn update_persistence_snapshot(data: AstralData) {
-    let mut snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap();
+    // 🛡️ 安全获取锁：unwrap_or_else 处理 poisoned 状态（虽然 panic=abort 下不会发生）
+    let mut snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
     *snapshot = Some(data);
 }
 
 fn perform_final_save(app: &tauri::AppHandle) {
-    let snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap();
+    let snapshot = PERSISTENCE_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(data) = snapshot.as_ref() {
         if let Ok(config_dir) = app.path().app_config_dir() {
             let _ = fs::create_dir_all(&config_dir);
@@ -187,7 +188,7 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
     log_smtc("---------- SMTC Metadata Sync ----------");
     
     {
-        let mut controls_guard = handle.controls.lock().unwrap();
+        let mut controls_guard = handle.controls.lock().unwrap_or_else(|e| e.into_inner());
         if controls_guard.is_none() {
             log_smtc("[NATIVE] First track played. Lazy initializing SMTC controls...");
             let config = PlatformConfig { 
@@ -198,7 +199,8 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
             
             if let Ok(mut new_controls) = MediaControls::new(config) {
                 let app_clone = app.clone();
-                new_controls.attach(move |event| {
+                // 🛡️ 安全 attach：如果失败只打印警告，不 abort
+                if let Err(e) = new_controls.attach(move |event| {
                     match event {
                         MediaControlEvent::Play | MediaControlEvent::Pause | MediaControlEvent::Toggle => { 
                             let _ = app_clone.emit("smtc-toggle", ()); 
@@ -207,10 +209,12 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
                         MediaControlEvent::Previous => { let _ = app_clone.emit("smtc-prev", ()); },
                         _ => {}
                     }
-                }).unwrap();
-                
-                *controls_guard = Some(new_controls);
-                log_smtc("[NATIVE] SMTC initialized and hooked successfully.");
+                }) {
+                    log_smtc(&format!("[ERROR] SMTC attach failed: {:?}", e));
+                } else {
+                    *controls_guard = Some(new_controls);
+                    log_smtc("[NATIVE] SMTC initialized and hooked successfully.");
+                }
             } else {
                 log_smtc("[ERROR] Failed to initialize SMTC controls.");
             }
@@ -255,7 +259,7 @@ async fn sync_smtc_metadata(app: tauri::AppHandle, handle: tauri::State<'_, Smtc
 
 #[tauri::command]
 async fn sync_smtc_status(handle: tauri::State<'_, SmtcHandle>, is_playing: bool) -> Result<(), String> {
-    let mut controls_guard = handle.controls.lock().unwrap();
+    let mut controls_guard = handle.controls.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(controls) = controls_guard.as_mut() {
         let playback = if is_playing { 
             MediaPlayback::Playing { progress: None } 
@@ -288,12 +292,22 @@ fn main() {
             }
         })
         .setup(move |app| {
-            let main_window = app.get_webview_window("main").unwrap();
+            // 🛡️ 安全获取主窗口
+            let main_window = match app.get_webview_window("main") {
+                Some(w) => w,
+                None => {
+                    eprintln!("[FATAL] Cannot find main window. UI may not be configured correctly.");
+                    return Ok(());
+                }
+            };
             let app_handle = app.handle().clone();
             
-            let hwnd_ptr = match main_window.window_handle().unwrap().as_raw() {
-                RawWindowHandle::Win32(h) => h.hwnd.get() as isize,
-                _ => 0,
+            let hwnd_ptr = match main_window.window_handle() {
+                Ok(handle) => match handle.as_raw() {
+                    RawWindowHandle::Win32(h) => h.hwnd.get() as isize,
+                    _ => 0,
+                },
+                Err(_) => 0,
             };
 
             let window_clone = main_window.clone();

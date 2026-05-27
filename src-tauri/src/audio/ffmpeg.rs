@@ -57,9 +57,11 @@ pub struct FFmpegEngine {
 }
 
 impl FFmpegEngine {
-    pub fn new(stream_handle: OutputStreamHandle) -> Self { 
-        let sink = Sink::try_new(&stream_handle).expect("Failed to create FFmpeg Sink");
-        Self { 
+    /// 🛡️ 安全构造：返回 Result 而非 panic
+    pub fn try_new(stream_handle: OutputStreamHandle) -> Result<Self, String> {
+        let sink = Sink::try_new(&stream_handle)
+            .map_err(|e| format!("Failed to create FFmpeg Sink: {}", e))?;
+        Ok(Self { 
             sink: Arc::new(Mutex::new(sink)),
             stream_handle,
             current_samples: None,
@@ -71,7 +73,11 @@ impl FFmpegEngine {
             is_playing: Arc::new(AtomicBool::new(false)),
             channel_mode: Arc::new(RwLock::new(ChannelConfig::Stereo)),
             fade_token: Arc::new(AtomicUsize::new(0)),
-        } 
+        })
+    }
+
+    pub fn new(stream_handle: OutputStreamHandle) -> Self { 
+        Self::try_new(stream_handle).expect("[FFMPEG] Fatal: Cannot create initial audio sink")
     }
 
     fn get_ffmpeg_dir() -> PathBuf {
@@ -106,7 +112,7 @@ impl FFmpegEngine {
         #[cfg(windows)]
         let url = "https://ghproxy.net/https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
         let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().map_err(|e| e.to_string())?;
-        window.emit("ffmpeg-status", "downloading").unwrap();
+        let _ = window.emit("ffmpeg-status", "downloading");
         let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
         let total_size = response.content_length().unwrap_or(0);
         let mut downloaded: u64 = 0;
@@ -121,10 +127,14 @@ impl FFmpegEngine {
                 _ => return Err("Download Failed".into()),
             }
         }
-        window.emit("ffmpeg-status", "extracting");
+        let _ = window.emit("ffmpeg-status", "extracting");
         let mut archive = ZipArchive::new(Cursor::new(chunks)).map_err(|e| e.to_string())?;
         for i in 0..archive.len() {
-            let mut file = archive.by_index(i).unwrap();
+            // 🛡️ 安全获取 zip 条目
+            let mut file = match archive.by_index(i) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
             if file.name().ends_with("ffmpeg.exe") {
                 let target_path = Self::get_ffmpeg_exe();
                 if let Some(p) = target_path.parent() { fs::create_dir_all(p).ok(); }
@@ -133,7 +143,7 @@ impl FFmpegEngine {
                 break;
             }
         }
-        window.emit("ffmpeg-status", "ready");
+        let _ = window.emit("ffmpeg-status", "ready");
         Ok(())
     }
 }
@@ -176,6 +186,10 @@ impl AudioEngine for FFmpegEngine {
         if self.is_playing.load(Ordering::SeqCst) { self.is_playing.store(false, Ordering::SeqCst); thread::sleep(Duration::from_millis(40)); }
 
         let ffmpeg_exe = Self::get_ffmpeg_exe();
+        if !ffmpeg_exe.exists() {
+            return Err("Play failed: FFmpeg engine binary not found".to_string());
+        }
+        
         let target_sr = get_dynamic_target_sr();
         
         println!("\x1b[36m[FFMPEG] Audio Engine Decoder Initialized: Target SR = {}Hz, Channels = 2\x1b[0m", target_sr);
@@ -198,9 +212,9 @@ impl AudioEngine for FFmpegEngine {
         #[cfg(target_os = "windows")]
         { cmd.creation_flags(0x08000000); }
 
-        let mut child = cmd.spawn().map_err(|e| format!("Spawn failed: {}", e))?;
-        let mut stdout = child.stdout.take().ok_or("Stdout failed")?;
-        let stderr = child.stderr.take().ok_or("Stderr failed")?;
+        let mut child = cmd.spawn().map_err(|e| format!("Play failed: FFmpeg spawn error - {}", e))?;
+        let mut stdout = child.stdout.take().ok_or_else(|| "Play failed: cannot capture FFmpeg stdout".to_string())?;
+        let stderr = child.stderr.take().ok_or_else(|| "Play failed: cannot capture FFmpeg stderr".to_string())?;
 
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
@@ -210,14 +224,26 @@ impl AudioEngine for FFmpegEngine {
         });
 
         let mut raw_bytes = Vec::new();
-        stdout.read_to_end(&mut raw_bytes).map_err(|e| e.to_string())?;
+        stdout.read_to_end(&mut raw_bytes).map_err(|e| format!("Play failed: FFmpeg read error - {}", e))?;
 
-        if raw_bytes.is_empty() { return Err("FFmpeg output is empty. Check logs.".into()); }
+        // 🛡️ 等待子进程结束，获取退出状态
+        let exit_status = child.wait().ok();
+
+        if raw_bytes.is_empty() { 
+            let exit_info = exit_status
+                .map(|s| format!(" (exit code: {:?})", s.code()))
+                .unwrap_or_default();
+            return Err(format!("Play failed: FFmpeg produced no output{}. File may not be valid audio.", exit_info)); 
+        }
 
         let sample_count = raw_bytes.len() / 4;
         let mut samples = Vec::with_capacity(sample_count);
         for chunk in raw_bytes.chunks_exact(4) {
             samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+
+        if samples.is_empty() {
+            return Err("Play failed: no valid audio samples decoded".to_string());
         }
 
         let samples_arc = Arc::new(samples);
@@ -235,12 +261,16 @@ impl AudioEngine for FFmpegEngine {
         
         self.fade_token.fetch_add(1, Ordering::SeqCst);
 
-        let target_channels = *self.channel_mode.read().unwrap() as u16;
+        let target_channels = *self.channel_mode.read().unwrap_or_else(|e| e.into_inner()) as u16;
         let buffer = super::galaxy::ArcSliceSource::new(samples_arc.clone(), 2, target_sr);
         let duration = buffer.total_duration().unwrap_or(Duration::from_secs(0)).as_secs_f64();
 
-        let mut sink_guard = self.sink.lock().unwrap();
-        *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+        // 🛡️ 安全创建 Sink
+        let new_sink = Sink::try_new(&self.stream_handle)
+            .map_err(|e| format!("Play failed: cannot create audio output - {}", e))?;
+
+        let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        *sink_guard = new_sink;
         sink_guard.set_volume(1.0);
         sink_guard.append(UpmixSource::new(buffer, target_channels, self.is_playing.clone(), self.current_volume.clone()));
         sink_guard.play();
@@ -302,24 +332,36 @@ impl AudioEngine for FFmpegEngine {
             self.last_play_us.store(u64::MAX, Ordering::SeqCst);
         }
         
+        // 🛡️ 安全创建 Sink：失败时中止 seek 而非 abort
         {
-            let mut sink_guard = self.sink.lock().unwrap();
-            *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+            let new_sink = match Sink::try_new(&self.stream_handle) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[FFMPEG] Seek failed: cannot create sink - {}", e);
+                    if is_playing_now { self.is_playing.store(true, Ordering::SeqCst); }
+                    return;
+                }
+            };
+            let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+            *sink_guard = new_sink;
         }
-        let target_channels = *self.channel_mode.read().unwrap() as u16;
+        let target_channels = *self.channel_mode.read().unwrap_or_else(|e| e.into_inner()) as u16;
         if let Some(samples_arc) = &self.current_samples {
              let source = super::galaxy::ArcSliceSource::new(samples_arc.clone(), 2, self.sample_rate).skip_duration(Duration::from_secs_f64(time));
-             let sink_guard = self.sink.lock().unwrap();
+             let sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
              sink_guard.set_volume(1.0);
              sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
         }
-        if is_playing_now { self.is_playing.store(true, Ordering::SeqCst); self.sink.lock().unwrap().play(); }
+        if is_playing_now { 
+            self.is_playing.store(true, Ordering::SeqCst); 
+            if let Ok(s) = self.sink.lock() { s.play(); }
+        }
     }
 
     fn set_volume(&mut self, vol: f32) { self.current_volume.store(vol.to_bits(), Ordering::SeqCst); }
 
     fn set_channel_mode(&mut self, _mode: u16) {
         let config = match _mode { 6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, 106 => ChannelConfig::True51, 108 => ChannelConfig::True71, _ => ChannelConfig::Stereo };
-        *self.channel_mode.write().unwrap() = config;
+        if let Ok(mut w) = self.channel_mode.write() { *w = config; }
     }
 }

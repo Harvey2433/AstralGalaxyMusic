@@ -123,6 +123,15 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         let source_sr = input.sample_rate();
         let channels = input.channels() as usize;
 
+        // 🛡️ 防御无效参数：如果源参数异常，直接旁路不做重采样
+        if source_sr == 0 || channels == 0 {
+            debug_log!("WARNING: Invalid source params (SR={}, CH={}). Bypassing resampler for safety.", source_sr, channels);
+            return Self {
+                input, resampler: None, input_buffers: vec![], output_buffer: vec![],
+                output_pos: 0, channels: channels.max(1), chunk_size: 0, target_sr: target_sr.max(1), source_sr: source_sr.max(1), exhausted: false,
+            };
+        }
+
         if source_sr == target_sr {
             debug_log!("Source SR ({}) matches Target SR. Bypassing Resampler.", source_sr);
             return Self {
@@ -132,23 +141,46 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         }
 
         debug_log!("Rubato Resampler Activated: {}Hz -> {}Hz", source_sr, target_sr);
-        let chunk_size = 2048; 
+        // 旧参数
+        //let chunk_size = 2048; 
         
+        //let params = SincInterpolationParameters {
+        //    sinc_len: 256, 
+        //    f_cutoff: 0.985, 
+        //    interpolation: SincInterpolationType::Cubic, 
+        //    oversampling_factor: 256, 
+        //    window: WindowFunction::BlackmanHarris2,
+        //};
+
+        let chunk_size = 1024;  // ← 减小：降低单次处理延迟，对播放器无感知影响
+
         let params = SincInterpolationParameters {
-            sinc_len: 256, 
-            f_cutoff: 0.985, 
-            interpolation: SincInterpolationType::Cubic, 
-            oversampling_factor: 256, 
-            window: WindowFunction::BlackmanHarris2,
+            sinc_len: 256,                              // 甜点：再高会产生可闻的 pre-ringing
+            f_cutoff: 0.9473,                           // SoX VHQ 等效值，让滤波器在256taps下
+                                                        // 完美达到92dB阻带衰减
+            interpolation: SincInterpolationType::Cubic, // 保持
+            oversampling_factor: 160,                   // 从256降到160：差异<-150dB，纯浪费内存
+            window: WindowFunction::BlackmanHarris2,    // 保持：92dB旁瓣抑制
         };
 
-        let resampler = SincFixedIn::<f32>::new(
+
+        // 🛡️ 安全创建重采样器：如果参数异常导致创建失败，回退到直通模式
+        let resampler = match SincFixedIn::<f32>::new(
             target_sr as f64 / source_sr as f64,
             2.0,
             params,
             chunk_size,
             channels,
-        ).unwrap();
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                debug_log!("WARNING: Resampler creation failed: {}. Falling back to bypass.", e);
+                return Self {
+                    input, resampler: None, input_buffers: vec![], output_buffer: vec![],
+                    output_pos: 0, channels, chunk_size: 0, target_sr: source_sr, source_sr, exhausted: false,
+                };
+            }
+        };
 
         Self {
             input,
@@ -182,8 +214,22 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
         }
 
         if frames_read == 0 && self.exhausted { return; }
-        let out_buffers = self.resampler.as_mut().unwrap().process(&self.input_buffers, None).unwrap();
+        
+        // 🛡️ 安全处理重采样：捕获 process() 错误而非 panic
+        let out_buffers = match self.resampler.as_mut().unwrap().process(&self.input_buffers, None) {
+            Ok(buffers) => buffers,
+            Err(e) => {
+                debug_log!("WARNING: Resampler process error: {}. Marking stream exhausted.", e);
+                self.exhausted = true;
+                return;
+            }
+        };
+        
         self.output_buffer.clear();
+        if out_buffers.is_empty() || out_buffers[0].is_empty() {
+            self.exhausted = true;
+            return;
+        }
         let out_frames = out_buffers[0].len();
         let valid_out_frames = if self.exhausted {
             (frames_read as f64 * (self.target_sr as f64 / self.source_sr as f64)).round() as usize
@@ -191,7 +237,11 @@ impl<I: Source<Item = f32>> RubatoSource<I> {
 
         for i in 0..valid_out_frames.min(out_frames) {
             for ch in 0..self.channels {
-                let mut sample = out_buffers[ch][i];
+                let mut sample = if ch < out_buffers.len() && i < out_buffers[ch].len() {
+                    out_buffers[ch][i]
+                } else {
+                    0.0
+                };
                 //if sample.abs() > 0.95 {
                 //    let overshoot = sample.abs() - 0.95;
                 //    sample = sample.signum() * (0.95 + overshoot * 0.5);
@@ -238,8 +288,9 @@ pub struct SpatialProcessor {
 
 impl SpatialProcessor {
     pub fn new(sample_rate: u32) -> Self {
-        let delay_samples = (sample_rate as f32 * 0.020) as usize;
-        let dt = 1.0 / sample_rate as f32;
+        let safe_sr = sample_rate.max(1); // 🛡️ 防止除零
+        let delay_samples = (safe_sr as f32 * 0.020) as usize;
+        let dt = 1.0 / safe_sr as f32;
         let rc = 1.0 / (2.0 * std::f32::consts::PI * 120.0);
         let alpha = dt / (rc + dt);
         Self { lfe_state: 0.0, delay_buffer: vec![(0.0, 0.0); delay_samples.max(1)], delay_pos: 0, alpha }
@@ -281,13 +332,14 @@ impl<I: Source<Item = f32>> UpmixSource<I> {
         let (target_channels, virtualize) = match config_code {
             6 => (6, true), 8 => (8, true), 106 => (6, false), 108 => (8, false), _ => (2, false),
         };
+        let safe_sr = sample_rate.max(1) as f32; // 🛡️ 防止除零
         Self { 
             input, target_channels, virtualize, current_frame: Vec::with_capacity(8), 
             dsp: SpatialProcessor::new(sample_rate),
             dc_l: 0.0, dc_r: 0.0, prev_l: 0.0, prev_r: 0.0,
-            is_playing_flag, state_vol: 0.0, fade_step: 1.0 / (sample_rate.max(1) as f32 * 0.03), 
+            is_playing_flag, state_vol: 0.0, fade_step: 1.0 / (safe_sr * 0.03), 
             master_vol_current: f32::from_bits(master_vol_target.load(Ordering::Relaxed)),
-            master_vol_target, master_vol_alpha: 1.0 / (sample_rate.max(1) as f32 * 0.02), 
+            master_vol_target, master_vol_alpha: 1.0 / (safe_sr * 0.02), 
             is_first_run: true,
         }
     }
@@ -299,11 +351,13 @@ impl<I: Source<Item = f32>> UpmixSource<I> {
             val 
         } else {
             let diff = abs_val - 0.98;
-            val.signum() * (0.98 + diff / (1.0 + diff * 8.0)) 
+            // 极限渐近线算法：当 diff 趋近于无穷大时，增加的值无限趋近于 0.019。
+            // 最终结果永远被死死锁在 0.98 + 0.019 = 0.999 以内！
+            let safe_diff = (0.019 * diff) / (0.019 + diff);
+            val.signum() * (0.98 + safe_diff) 
         }
     }
 }
-
 impl<I: Source<Item = f32>> Iterator for UpmixSource<I> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
@@ -410,7 +464,7 @@ pub struct ArcSliceSource {
 
 impl ArcSliceSource {
     pub fn new(data: Arc<Vec<f32>>, channels: u16, sample_rate: u32) -> Self {
-        Self { data, pos: 0, channels, sample_rate }
+        Self { data, pos: 0, channels: channels.max(1), sample_rate: sample_rate.max(1) }
     }
     pub fn skip_duration(mut self, duration: Duration) -> Self {
         let offset = (duration.as_secs_f64() * self.sample_rate as f64 * self.channels as f64) as usize;
@@ -459,9 +513,11 @@ pub struct GalaxyEngine {
 }
 
 impl GalaxyEngine {
-    pub fn new(stream_handle: OutputStreamHandle) -> Self {
-        let sink = Sink::try_new(&stream_handle).unwrap();
-        Self {
+    /// 🛡️ 安全构造：返回 Result 而非 panic
+    pub fn try_new(stream_handle: OutputStreamHandle) -> Result<Self, String> {
+        let sink = Sink::try_new(&stream_handle)
+            .map_err(|e| format!("Failed to create audio sink: {}", e))?;
+        Ok(Self {
             sink: Arc::new(Mutex::new(sink)),
             stream_handle,
             raw_bytes: None,
@@ -476,12 +532,16 @@ impl GalaxyEngine {
             playback_pos: Arc::new(AtomicU64::new(f64_to_bits(0.0))),
             last_play_us: Arc::new(AtomicU64::new(u64::MAX)),
             fade_token: Arc::new(AtomicUsize::new(0)),
-        }
+        })
+    }
+
+    pub fn new(stream_handle: OutputStreamHandle) -> Self {
+        Self::try_new(stream_handle).expect("[GALAXY] Fatal: Cannot create initial audio sink")
     }
 
     fn create_decoder(data: &Arc<Vec<u8>>) -> Result<Decoder<Cursor<Vec<u8>>>, String> {
         let cursor = Cursor::new(data.to_vec()); 
-        Decoder::new(cursor).map_err(|e| e.to_string())
+        Decoder::new(cursor).map_err(|e| format!("Play failed: audio decode error - {}", e))
     }
 }
 
@@ -525,15 +585,20 @@ impl AudioEngine for GalaxyEngine {
             thread::sleep(Duration::from_millis(40)); 
         }
 
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
-        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        let mut file = File::open(path).map_err(|e| format!("Play failed: {}", e))?;
+        let len = file.metadata().map_err(|e| format!("Play failed: {}", e))?.len();
         let mut buffer = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+        file.read_to_end(&mut buffer).map_err(|e| format!("Play failed: {}", e))?;
         let raw_bytes = Arc::new(buffer);
 
         let source = Self::create_decoder(&raw_bytes)?;
         
         debug_log!("Audio Engine Decoder Initialized: Source SR = {}Hz, Channels = {}", source.sample_rate(), source.channels());
+        
+        // 🛡️ 验证解码器输出的基本参数合法性
+        if source.sample_rate() == 0 || source.channels() == 0 {
+            return Err("Play failed: audio file reports invalid sample rate or channel count".to_string());
+        }
         
         let target_sr = get_dynamic_target_sr();
         let hq_source = RubatoSource::new(source.convert_samples::<f32>(), target_sr);
@@ -543,7 +608,7 @@ impl AudioEngine for GalaxyEngine {
         let total_duration = hq_source.total_duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
         let my_session = self.decode_session.fetch_add(1, Ordering::SeqCst) + 1;
-        *self.decoded_samples.write().unwrap() = None;
+        if let Ok(mut w) = self.decoded_samples.write() { *w = None; }
         self.is_decoded.store(false, Ordering::Release);
         
         self.playback_pos.store(f64_to_bits(0.0), Ordering::SeqCst);
@@ -568,33 +633,53 @@ impl AudioEngine for GalaxyEngine {
         thread::spawn(move || {
             debug_log!("Background full-decode thread started (Normal Priority to protect real-time stream!).");
             
-            if let Ok(decoder) = Decoder::new(Cursor::new(raw_bytes_clone.to_vec())) {
-                let hq_source = RubatoSource::new(decoder.convert_samples::<f32>(), bg_target_sr);
-                let mut pcm_buffer = Vec::with_capacity(bg_target_sr as usize * 2 * 180); 
-                let mut count = 0;
-                
-                for sample in hq_source {
-                    pcm_buffer.push(sample);
-                    count += 1;
+            // 🛡️ 后台解码线程：失败时也要正确标记 is_decoded，防止 seek() 永久阻塞
+            let decode_result = Decoder::new(Cursor::new(raw_bytes_clone.to_vec()));
+            match decode_result {
+                Ok(decoder) => {
+                    let hq_source = RubatoSource::new(decoder.convert_samples::<f32>(), bg_target_sr);
+                    let mut pcm_buffer = Vec::with_capacity(bg_target_sr as usize * 2 * 180); 
+                    let mut count = 0;
                     
-                    if count % 4096 == 0 {
-                        if session_ref.load(Ordering::SeqCst) != my_session { return; }
-                        thread::sleep(Duration::from_millis(1));
+                    for sample in hq_source {
+                        pcm_buffer.push(sample);
+                        count += 1;
+                        
+                        if count % 4096 == 0 {
+                            if session_ref.load(Ordering::SeqCst) != my_session { return; }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    
+                    if session_ref.load(Ordering::SeqCst) == my_session {
+                        if let Ok(mut w) = samples_ref.write() {
+                            *w = Some(Arc::new(pcm_buffer));
+                        }
+                        is_decoded_ref.store(true, Ordering::Release);
+                        debug_log!("Background full-decode complete.");
                     }
                 }
-                
-                if session_ref.load(Ordering::SeqCst) == my_session {
-                    *samples_ref.write().unwrap() = Some(Arc::new(pcm_buffer));
-                    is_decoded_ref.store(true, Ordering::Release);
-                    debug_log!("Background full-decode complete.");
+                Err(e) => {
+                    debug_log!("WARNING: Background decode failed: {}. Marking as complete with empty buffer.", e);
+                    if session_ref.load(Ordering::SeqCst) == my_session {
+                        if let Ok(mut w) = samples_ref.write() {
+                            *w = Some(Arc::new(Vec::new()));
+                        }
+                        is_decoded_ref.store(true, Ordering::Release);
+                    }
                 }
             }
         });
 
         {
-           let target_channels = *self.channel_mode.read().unwrap() as u16;
-           let mut sink_guard = self.sink.lock().unwrap();
-           *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+           let target_channels = *self.channel_mode.read().unwrap_or_else(|e| e.into_inner()) as u16;
+           
+           // 🛡️ 安全创建 Sink
+           let new_sink = Sink::try_new(&self.stream_handle)
+               .map_err(|e| format!("Play failed: cannot create audio output - {}", e))?;
+           
+           let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+           *sink_guard = new_sink;
            sink_guard.set_volume(1.0);
     
            // 直接把第一步建立的实时流 hq_source 挂上去播放！
@@ -666,20 +751,40 @@ impl AudioEngine for GalaxyEngine {
 
         if !self.is_decoded.load(Ordering::Acquire) {
             debug_log!("Seek triggered before full-decode complete. Synchronously waiting for background process...");
+            // 🛡️ 超时保护：防止后台线程异常退出导致永久阻塞
+            let wait_start = Instant::now();
             while !self.is_decoded.load(Ordering::Acquire) {
+                if wait_start.elapsed() > Duration::from_secs(30) {
+                    debug_log!("WARNING: Background decode wait timeout (30s). Aborting seek to prevent hang.");
+                    if is_playing_now { self.is_playing.store(true, Ordering::SeqCst); }
+                    return;
+                }
                 thread::sleep(Duration::from_millis(50));
             }
             debug_log!("Background process finished! Executing zero-copy instant seek.");
         }
 
-        let target_channels = *self.channel_mode.read().unwrap() as u16;
-        let mut sink_guard = self.sink.lock().unwrap();
-        *sink_guard = Sink::try_new(&self.stream_handle).unwrap();
+        let target_channels = *self.channel_mode.read().unwrap_or_else(|e| e.into_inner()) as u16;
         
-        if let Some(samples_arc) = self.decoded_samples.read().unwrap().clone() {
-            let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate)
-                .skip_duration(Duration::from_secs_f64(time));
-            sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
+        // 🛡️ 安全创建 Sink：失败时中止 seek 而非 abort
+        let new_sink = match Sink::try_new(&self.stream_handle) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[GALAXY] Seek failed: cannot create sink - {}", e);
+                if is_playing_now { self.is_playing.store(true, Ordering::SeqCst); }
+                return;
+            }
+        };
+        
+        let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        *sink_guard = new_sink;
+        
+        if let Some(samples_arc) = self.decoded_samples.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            if !samples_arc.is_empty() {
+                let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate)
+                    .skip_duration(Duration::from_secs_f64(time));
+                sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
+            }
         }
         
         sink_guard.set_volume(1.0); 
@@ -698,6 +803,6 @@ impl AudioEngine for GalaxyEngine {
             6 => ChannelConfig::Surround51, 8 => ChannelConfig::Surround71, 
             106 => ChannelConfig::True51, 108 => ChannelConfig::True71, _ => ChannelConfig::Stereo,
         };
-        *self.channel_mode.write().unwrap() = config;
+        if let Ok(mut w) = self.channel_mode.write() { *w = config; }
     }
 }
