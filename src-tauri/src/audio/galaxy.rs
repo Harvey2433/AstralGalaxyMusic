@@ -734,6 +734,8 @@ impl AudioEngine for GalaxyEngine {
     }
 
     fn seek(&mut self, time: f64) {
+        let _seek_start = Instant::now();
+
         let is_playing_now = self.is_playing.load(Ordering::SeqCst);
         if is_playing_now {
             self.is_playing.store(false, Ordering::SeqCst);
@@ -750,23 +752,24 @@ impl AudioEngine for GalaxyEngine {
         }
 
         if !self.is_decoded.load(Ordering::Acquire) {
-            debug_log!("Seek triggered before full-decode complete. Synchronously waiting for background process...");
-            // 🛡️ 超时保护：防止后台线程异常退出导致永久阻塞
-            let wait_start = Instant::now();
-            while !self.is_decoded.load(Ordering::Acquire) {
-                if wait_start.elapsed() > Duration::from_secs(30) {
-                    debug_log!("WARNING: Background decode wait timeout (30s). Aborting seek to prevent hang.");
+            debug_log!("Seek triggered before full-decode complete. Waiting for background decoder...");
+            let current_session = self.decode_session.load(Ordering::SeqCst);
+            loop {
+                if self.is_decoded.load(Ordering::Acquire) {
+                    break;
+                }
+                if self.decode_session.load(Ordering::SeqCst) != current_session {
+                    debug_log!("Seek aborted: decode session changed (new track loaded).");
                     if is_playing_now { self.is_playing.store(true, Ordering::SeqCst); }
                     return;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            debug_log!("Background process finished! Executing zero-copy instant seek.");
+            debug_log!("Background decode finished. Executing zero-copy instant seek.");
         }
 
         let target_channels = *self.channel_mode.read().unwrap_or_else(|e| e.into_inner()) as u16;
-        
-        // 🛡️ 安全创建 Sink：失败时中止 seek 而非 abort
+
         let new_sink = match Sink::try_new(&self.stream_handle) {
             Ok(s) => s,
             Err(e) => {
@@ -775,23 +778,30 @@ impl AudioEngine for GalaxyEngine {
                 return;
             }
         };
-        
-        let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        *sink_guard = new_sink;
-        
+
+        let old_sink = {
+            let mut sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *sink_guard, new_sink)
+        };
+        thread::spawn(move || drop(old_sink));
+
         if let Some(samples_arc) = self.decoded_samples.read().unwrap_or_else(|e| e.into_inner()).clone() {
             if !samples_arc.is_empty() {
                 let source = ArcSliceSource::new(samples_arc, self.channels, self.sample_rate)
                     .skip_duration(Duration::from_secs_f64(time));
+                let sink_guard = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+                sink_guard.set_volume(1.0);
                 sink_guard.append(UpmixSource::new(source, target_channels, self.is_playing.clone(), self.current_volume.clone()));
+                if is_playing_now {
+                    self.is_playing.store(true, Ordering::SeqCst);
+                    sink_guard.play();
+                }
             }
-        }
-        
-        sink_guard.set_volume(1.0); 
-        if is_playing_now {
+        } else if is_playing_now {
             self.is_playing.store(true, Ordering::SeqCst);
-            sink_guard.play(); 
         }
+
+        println!("[GALAXY] seek({:.3}s) completed in {:?}", time, _seek_start.elapsed());
     }
 
     fn set_volume(&mut self, vol: f32) {

@@ -4,9 +4,9 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event'; 
 import { usePlayerStore } from './stores/player'; 
+import { getOriginalCover } from './stores/modules/playlist';
 import { Play, Heart } from 'lucide-vue-next';
 
-// 导入模块化组件
 import TheIsland from './components/TheIsland.vue';
 import SideNavigation from './components/SideNavigation.vue';
 import PlaylistDrawer from './components/PlaylistDrawer.vue';
@@ -61,39 +61,57 @@ const notify = (text: string, type: 'info' | 'error' | 'cooling' = 'info') => {
 // ==========================================
 let isSmtcActiveInBackend = false; 
 
+// Watcher 1: SMTC 启用/禁用状态管理
 watch(
-  () => [player.currentTrack, player.isPlaying, player.isSmtcEnabled, player.hasStarted], 
-  async ([newTrack, isPlaying, isEnabled, hasStarted]) => {
-    
+  () => [player.isSmtcEnabled, player.hasStarted] as const,
+  ([isEnabled, hasStarted]) => {
     if (!isEnabled || !hasStarted) {
-        if (isSmtcActiveInBackend) {
-            invoke('toggle_smtc_active', { enable: false }).catch(e => console.error(e));
-            isSmtcActiveInBackend = false;
+      if (isSmtcActiveInBackend) {
+        invoke('toggle_smtc_active', { enable: false }).catch(e => console.error(e));
+        isSmtcActiveInBackend = false;
+      }
+    } else if (!isSmtcActiveInBackend) {
+      invoke('toggle_smtc_active', { enable: true }).then(() => {
+        isSmtcActiveInBackend = true;
+        if (player.currentTrack) {
+          invoke('sync_smtc_metadata', {
+            title: player.currentTrack.title || 'Unknown',
+            artist: player.currentTrack.artist || 'Unknown',
+            cover: getOriginalCover(player.currentTrack.cover) || ''
+          }).catch(e => console.error(e));
         }
-        return;
+        invoke('sync_smtc_status', { isPlaying: !!player.isPlaying }).catch(e => console.error(e));
+      }).catch(e => console.error(e));
     }
+  }
+);
 
-    if (!isSmtcActiveInBackend) {
-        await invoke('toggle_smtc_active', { enable: true }).catch(e => console.error(e));
-        isSmtcActiveInBackend = true; 
+// Watcher 2: 曲目元数据同步
+watch(
+  () => player.currentTrack?.id,
+  () => {
+    if (!player.isSmtcEnabled || !player.hasStarted || !isSmtcActiveInBackend) return;
+    if (player.currentTrack && player.currentTrack.id) {
+      invoke('sync_smtc_metadata', {
+        title: player.currentTrack.title || 'Unknown',
+        artist: player.currentTrack.artist || 'Unknown',
+        cover: getOriginalCover(player.currentTrack.cover) || ''
+      }).catch(e => console.error(e));
     }
+  }
+);
 
-    if (newTrack && (newTrack as any).id) {
-        invoke('sync_smtc_metadata', {
-          title: (newTrack as any).title || 'Unknown',
-          artist: (newTrack as any).artist || 'Unknown',
-          cover: (newTrack as any).cover || ''
-        }).catch(e => console.error(e));
-    }
-
+// Watcher 3: 播放状态同步
+watch(
+  () => player.isPlaying,
+  (isPlaying) => {
+    if (!player.isSmtcEnabled || !player.hasStarted || !isSmtcActiveInBackend) return;
     invoke('sync_smtc_status', { isPlaying: !!isPlaying }).catch(e => console.error(e));
-    
-  }, 
-  { deep: true } 
+  }
 );
 
 // ==========================================
-// 🚀 初始化与系统环境封印
+// 初始化与系统环境封印
 // ==========================================
 onMounted(() => { 
   document.oncontextmenu = (e) => { e.preventDefault(); return false; };
@@ -185,7 +203,7 @@ onMounted(() => {
               <span class="opacity-0 group-hover:opacity-100 text-[6px] text-white">□</span>
             </button>
             <button @click="closeWindow" class="w-3.5 h-3.5 rounded-full bg-red-500/20 border border-red-500/50 hover:bg-red-500 transition-all duration-300 ease-[cubic-bezier(0.2,0.8,0.2,1)] hover:scale-125 active:scale-90 flex items-center justify-center group no-drag-btn no-outline">
-              <span class="opacity-0 group-hover:opacity-100 text-[8px] text-white">✕</span>
+              <span class="opacity-0 group-hover:opacity-100 text-[8px] text-white">x</span>
             </button>
           </div>
         </header>
@@ -198,7 +216,7 @@ onMounted(() => {
                     <div v-for="track in player.likedQueue" :key="track.id" @dblclick="player.playTrack(track)" 
                         class="flex items-center gap-4 p-4 rounded-xl bg-white/5 hover:bg-white/10 active:scale-[0.98] transition-all duration-400 ease-[cubic-bezier(0.2,0.8,0.2,1)] group cursor-pointer">
                       <div class="relative w-12 h-12 rounded-lg overflow-hidden">
-                          <img :src="track.cover" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
+                          <img :src="track.cover" loading="lazy" decoding="async" class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110" />
                           <div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all duration-300">
                             <Play :size="20" class="text-white fill-white transition-transform duration-300 active:scale-75"/>
                           </div>
@@ -251,7 +269,6 @@ onMounted(() => {
 </template>
 
 <style>
-/* ✨ 交叉淡出专属平滑过渡效果 (PPT级别切歌动画) */
 .bg-fade-enter-active,
 .bg-fade-leave-active {
   transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -261,7 +278,6 @@ onMounted(() => {
   opacity: 0;
 }
 
-/* 基础封印与全局字体设置 */
 html { 
   font-size: 16px !important; 
   -webkit-text-size-adjust: 100%; 
@@ -280,7 +296,6 @@ body {
   -webkit-user-drag: none; 
 }
 
-/* 页面级物理弹簧动画 */
 .page-spring-enter-active, 
 .page-spring-leave-active { 
   transition: opacity 0.5s cubic-bezier(0.2, 0.8, 0.2, 1), transform 0.6s cubic-bezier(0.2, 0.8, 0.2, 1); 
@@ -288,7 +303,6 @@ body {
 .page-spring-enter-from { opacity: 0; transform: scale(0.96) translateY(15px); }
 .page-spring-leave-to { opacity: 0; transform: scale(1.04) translateY(-15px); }
 
-/* 全局辅助动效 */
 .animate-spin-slow { animation: spin 8s linear infinite; }
 .animate-spin-slow-reverse { animation: spin 12s linear infinite reverse; }
 .animate-pulse-slow { animation: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
@@ -305,18 +319,14 @@ body {
 .animate-float-slow { animation: float-slow 15s ease-in-out infinite; }
 .animate-float-slower { animation: float-slower 20s ease-in-out infinite reverse; }
 
-/* 拖拽区域支持 */
 [data-tauri-drag-region] { -webkit-app-region: drag; cursor: default; }
 button, input, select, [role="button"], .no-drag-btn { -webkit-app-region: no-drag; }
 
-/* 隐藏滚动条但保留功能 */
 .scrollbar-hide::-webkit-scrollbar { display: none; }
 .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
 
-/* 清除 Focus 轮廓线 */
 .no-outline:focus { outline: none; }
 
-/* 贡献者界面的黑幕淡入淡出动画 */
 .credits-fade-enter-active, .credits-fade-leave-active { 
   transition: opacity 1.5s ease-in-out; 
 }

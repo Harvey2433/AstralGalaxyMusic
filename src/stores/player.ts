@@ -1,921 +1,203 @@
 import { defineStore } from 'pinia';
-import { ref, watch, onMounted } from 'vue';
+import { ref, watch, onMounted, computed } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
 
 import { Track, NotificationCallback } from './modules/types';
-import { usePlaylist } from './modules/playlist';
+import { usePlaylist, preconvertCover, getOriginalCover } from './modules/playlist';
 import { useEngine } from './modules/engine';
-
-const DEFAULT_COVER = 'https://picui.ogmua.cn/s1/2026/03/09/69aeb0db3989e.webp';
+import { useVolume } from './modules/volume';
+import { useProgress } from './modules/progress';
+import { useImporter } from './modules/importer';
+import { usePersistence } from './modules/persistence';
+import { useFFmpegHandler } from './modules/ffmpeg-handler';
+import { useCredits } from './modules/credits';
+import { usePlayback } from './modules/playback';
 
 export const usePlayerStore = defineStore('player', () => {
-  const playlist = usePlaylist();
-  const engine = useEngine();
+    const playlist = usePlaylist();
+    const engine = useEngine();
+    const vol = useVolume();
 
-  const isPlaying = ref(false);
-  const isPaused = ref(false);
-  const hasStarted = ref(false);
-  const volume = ref(80);
-  const progress = ref(0);
-  const currentTime = ref(0);
-  
-  const isDragging = ref(false);   
-  const isBuffering = ref(false);  
-  const isSeeking = ref(false);    
-  const playSessionId = ref(0);    
-  const isTrackSwitching = ref(false);
+    const isPlaying = ref(false);
+    const isPaused = ref(false);
+    const hasStarted = ref(false);
+    const progress = ref(0);
+    const currentTime = ref(0);
 
-  const isSystemBusy = ref(false);
-  const needsInitialization = ref(false); 
+    const isDragging = ref(false);
+    const isBuffering = ref(false);
+    const isSeeking = ref(false);
+    const playSessionId = ref(0);
+    const isTrackSwitching = ref(false);
 
-  const isImporting = ref(false);
-  const importCount = ref(0);
-  const importTotal = ref(0);
-  const importProgress = ref(0);
+    const isSystemBusy = ref(false);
+    const needsInitialization = ref(false);
 
-  // ❤️ 我喜欢列表核心逻辑
-  const likedQueue = ref<Track[]>([]);
-  const toggleLike = (track: Track) => {
-      const idx = likedQueue.value.findIndex(t => t.id === track.id);
-      if (idx === -1) likedQueue.value.push(track);
-      else likedQueue.value.splice(idx, 1);
-  };
-  const isLiked = (track: Track) => {
-      return likedQueue.value.some(t => t.id === track.id);
-  };
+    const isImporting = ref(false);
+    const importCount = ref(0);
+    const importTotal = ref(0);
+    const importProgress = ref(0);
 
-  let actionTimeoutId: any = null;
-  let coolingTimerId: any = null;
-  let syncTimerId: any = null;
+    const likedQueue = ref<Track[]>([]);
+    const likedIdSet = new Set<string>();
 
-  const lastActiveVolume = ref(Number(localStorage.getItem('last_active_vol') || '80'));
-  const notifyUI = ref<NotificationCallback | null>(null);
-  const setNotifier = (fn: NotificationCallback) => { notifyUI.value = fn; };
+    const notifyUI = ref<NotificationCallback | null>(null);
+    const setNotifier = (fn: NotificationCallback) => { notifyUI.value = fn; };
 
-  let fadeRafId: number | null = null;
-  let actualVolume = 0.0;     
-  let lastIpcTime = 0;        
-  let playActionSession = 0;  
-
-  // 实时持久化快照同步防抖
-  let persistenceTimeout: any = null;
-  watch(
-    () => [volume.value, engine.activeEngine.value, engine.channelMode.value, engine.isTrueSurround.value, engine.activeDevice.value, likedQueue.value],
-    () => {
-        if (persistenceTimeout) clearTimeout(persistenceTimeout);
-        persistenceTimeout = setTimeout(() => {
-            invoke('update_persistence_snapshot', {
-                data: {
-                    settings: {
-                        volume: volume.value,
-                        engine_id: engine.activeEngine.value,
-                        channel_mode: engine.channelMode.value,
-                        is_true_surround: engine.isTrueSurround.value,
-                        output_device: engine.activeDevice.value
-                    },
-                    liked_tracks: likedQueue.value
-                }
-            }).catch(()=>{});
-        }, 1000);
-    },
-    { deep: true }
-  );
-
-  // ✨ 核心修复：移除 isSystemBusy 拦截锁，保证切换引擎的瞬间音量能够准确发送至底层
-  let backendVolRafId: number | null = null;
-  const setBackendVolume = (v: number) => {
-      actualVolume = Math.max(0, Math.min(1, v));
-      
-      if (backendVolRafId === null) {
-          backendVolRafId = requestAnimationFrame(() => {
-              const logVol = Math.pow(actualVolume, 2); 
-              invoke('player_set_volume', { vol: logVol }).catch(()=>{});
-              lastIpcTime = performance.now();
-              backendVolRafId = null;
-          });
-      }
-  };
-
-  const smoothVolumeTransition = (targetVol: number, duration: number, onComplete?: () => void) => {
-      if (fadeRafId !== null) {
-          cancelAnimationFrame(fadeRafId);
-          fadeRafId = null;
-      }
-
-      const startVol = actualVolume;
-      const diff = targetVol - startVol;
-
-      if (Math.abs(diff) < 0.001 || duration <= 0) {
-          setBackendVolume(targetVol);
-          if (onComplete) onComplete();
-          return;
-      }
-
-      let startTime: number | null = null;
-
-      const step = (timestamp: number) => {
-          if (startTime === null) startTime = timestamp;
-          const elapsed = timestamp - startTime;
-          let fadeProgress = Math.min(elapsed / duration, 1.0);
-
-          actualVolume = startVol + diff * fadeProgress;
-
-          if (timestamp - lastIpcTime > 33 || fadeProgress >= 1) {
-              const logVol = Math.pow(actualVolume, 2);
-              invoke('player_set_volume', { vol: logVol }).catch(()=>{});
-              lastIpcTime = timestamp;
-          }
-
-          if (fadeProgress >= 1) {
-              fadeRafId = null;
-              if (onComplete) onComplete();
-          } else {
-              fadeRafId = requestAnimationFrame(step);
-          }
-      };
-
-      fadeRafId = requestAnimationFrame(step);
-  };
-
-  const startGlobalSyncTimer = () => {
-      if (syncTimerId) clearInterval(syncTimerId);
-      syncTimerId = setInterval(async () => {
-          if (isPlaying.value && !isPaused.value && !isSystemBusy.value && !isDragging.value && !isSeeking.value && !isBuffering.value) {
-              try {
-                  const backendTime = await invoke<number>('get_current_time');
-                  if (Math.abs(currentTime.value - backendTime) > 0.15) {
-                      currentTime.value = backendTime;
-                      if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
-                          progress.value = (backendTime / playlist.currentTrack.value.duration) * 100;
-                      }
-                  }
-              } catch (e) { }
-          }
-      }, 3000);
-  };
-
-  const syncEngine = async () => {
-      try {
-          const realEngine = await invoke<string>('get_current_engine');
-          engine.activeEngine.value = realEngine;
-      } catch (e) { console.error(e); }
-  };
-
-  const startEngineCoolingTimer = () => {
-      if (coolingTimerId) clearInterval(coolingTimerId); 
-      engine.lastEngineSwitchTime.value = Date.now(); 
-      engine.engineCoolingRemaining.value = 30;
-
-      coolingTimerId = setInterval(() => {
-          const elapsed = (Date.now() - engine.lastEngineSwitchTime.value) / 1000;
-          if (elapsed >= 30) {
-              engine.engineCoolingRemaining.value = 0;
-              clearInterval(coolingTimerId);
-              coolingTimerId = null;
-          } else {
-              engine.engineCoolingRemaining.value = Math.ceil(30 - elapsed);
-          }
-      }, 1000);
-  };
-
-  onMounted(async () => {
-      await syncEngine();
-      
-      try {
-          const status = await invoke<string>('init_persistence_layer');
-          if (status === 'CORRUPT' || status === 'NO_FILE') {
-              if (status === 'CORRUPT') notifyUI.value?.('配置文件已损坏，重置为默认', 'error');
-              needsInitialization.value = true;
-          } else if (status === 'SUCCESS') {
-              const data = await invoke<any>('load_astral_data');
-              if (data && data.settings) {
-                  volume.value = data.settings.volume;
-                  lastActiveVolume.value = volume.value;
-                  engine.activeEngine.value = data.settings.engine_id;
-                  engine.activeDevice.value = data.settings.output_device;
-                  engine.channelMode.value = data.settings.channel_mode;
-                  engine.isTrueSurround.value = data.settings.is_true_surround;
-                  likedQueue.value = data.liked_tracks || [];
-
-                  // 核心增量：确保启动时强制进行一次物理音量对齐
-                  const initialVol = Math.pow(volume.value / 100.0, 2);
-                  invoke('player_set_volume', { vol: initialVol }).catch(()=>{});
-                  
-                  const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
-                  invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
-                  
-                  if (engine.activeEngine.value !== 'galaxy') {
-                      invoke('init_audio_engine', { engineId: engine.activeEngine.value }).catch(()=>{});
-                  }
-              }
-          }
-      } catch(e) {
-          needsInitialization.value = true;
-      }
-
-      await listen('ffmpeg-status', async (e: any) => {
-          const status = e.payload;
-          if (status === 'downloading') {
-              engine.isDownloadingFFmpeg.value = true;
-              engine.ffmpegProgress.value = 0;
-              notifyUI.value?.('Fetching engine...', 'info');
-          } else if (status === 'extracting') { 
-              engine.isDownloadingFFmpeg.value = true;
-              engine.ffmpegProgress.value = 99;
-              notifyUI.value?.('Extracting core...', 'info');
-          } else if (status === 'ready') { 
-              engine.ffmpegProgress.value = 100;
-              notifyUI.value?.('Core deployed');
-              
-              const savedTime = currentTime.value;
-              const wasPlaying = isPlaying.value;
-              const session = ++playActionSession;
-
-              // 🚀 此时确认 FFmpeg 已存在，正式开始切换逻辑，同步锁定 UI 并暂停音乐
-              isSystemBusy.value = true;
-              isBuffering.value = true;
-              engine.isEngineSwitching.value = true;
-
-              if (wasPlaying) {
-                  await executePauseLogic(session, true);
-                  await new Promise(r => setTimeout(r, 500));
-              }
-
-              try {
-                  const res = await invoke<string>('init_audio_engine', { engineId: 'ffmpeg' });
-                  
-                  if (res.includes("READY")) {
-                      engine.hasAudioInitialized.value = true;
-                      engine.activeEngine.value = 'ffmpeg';
-                      if (playlist.currentTrack.value) {
-                          // 核心增量：在引擎切换准备就绪时，注入当前 UI 绑定的真实音量状态，防止播放时音量归零
-                          const realTarget = volume.value / 100.0;
-                          setBackendVolume(realTarget);
-
-                          await invoke('player_load_track', { path: playlist.currentTrack.value.path });
-                          await invoke('player_seek', { time: savedTime });
-                          if (wasPlaying) await executePlayLogic(session, false); 
-                          else await invoke('player_pause');
-                      }
-                      startEngineCoolingTimer();
-                  }
-              } catch (err) {
-                  notifyUI.value?.('FFmpeg failed', 'error');
-              } finally {
-                  engine.isDownloadingFFmpeg.value = false;
-                  engine.isEngineSwitching.value = false;
-                  isSystemBusy.value = false;
-                  isBuffering.value = false;
-              }
-          } else if (status === 'cooling') {
-              engine.isDownloadingFFmpeg.value = false;
-              engine.isEngineSwitching.value = false;
-              startEngineCoolingTimer();
-              notifyUI.value?.('System cooling...', 'cooling');
-          } else if (status === 'error') {
-              engine.isDownloadingFFmpeg.value = false;
-              engine.isEngineSwitching.value = false; 
-              notifyUI.value?.('Download error', 'error');
-          }
-      });
-
-      await listen('ffmpeg-progress', (e: any) => { engine.ffmpegProgress.value = e.payload as number; });
-      await setupEventListeners();
-      startGlobalSyncTimer();
-  });
-
-  const setOutputDevice = async (device: string): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
-      // 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value) return 'FAILED';
-      if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
-      
-      engine.lastMixerActionTime.value = Date.now();
-      isSystemBusy.value = true;
-      isBuffering.value = true;
-      notifyUI.value?.(`Hot-swapping: ${device}...`, 'info');
-
-      try {
-        if (!hasStarted.value) {
-            engine.activeDevice.value = device;
-            return 'SUCCESS';
-          }
-        await invoke('set_output_device', { device });
-        engine.activeDevice.value = device;
-        engine.hasAudioInitialized.value = true;
-          
-          if (playlist.currentTrack.value) {
-              try {
-                  const backendTime = await invoke<number>('get_current_time');
-                  currentTime.value = backendTime;
-              } catch (e) {}
-          }
-          notifyUI.value?.('Output Swapped');
-          return 'SUCCESS';
-      } catch (e) { 
-          notifyUI.value?.('Migration Failed', 'error');
-          return 'FAILED'; 
-      } finally {
-          isSystemBusy.value = false;
-          isBuffering.value = false;
-      }
-  };
-
-  const switchEngine = async (engineId: string): Promise<'SUCCESS' | 'DOWNLOADING' | 'FAILED' | 'COOLING'> => {
-      if (isSystemBusy.value || engine.isDownloadingFFmpeg.value || engine.isEngineSwitching.value || isSeeking.value || isBuffering.value || isDragging.value) {
-          notifyUI.value?.('System busy', 'error'); return 'FAILED';
-      }
-      
-      const now = Date.now();
-      if (now - engine.lastEngineSwitchTime.value < 30000) {
-          const remaining = Math.ceil(30 - (now - engine.lastEngineSwitchTime.value) / 1000);
-          notifyUI.value?.(`Cooling: ${remaining}s`, 'cooling'); return 'COOLING';
-      }
-      
-      const previousEngine = engine.activeEngine.value;
-      if (previousEngine === engineId) return 'SUCCESS';
-      
-      // 🚀 核心修复：前置嗅探引擎。若不存在，仅发送下载指令并返回，不锁 UI，不停止音乐！
-      if (engineId === 'ffmpeg') {
-          try {
-              const exists = await invoke<boolean>('check_ffmpeg_exists');
-              if (!exists) {
-                  engine.isDownloadingFFmpeg.value = true;
-                  notifyUI.value?.('Fetching engine...', 'info');
-                  invoke('start_ffmpeg_download').catch(() => {});
-                  return 'DOWNLOADING';
-              }
-          } catch (e) {
-              console.error("FFmpeg check failed:", e);
-          }
-      }
-
-      isSystemBusy.value = true;
-      isBuffering.value = true;
-      engine.isEngineSwitching.value = true;
-      notifyUI.value?.(`Initializing ${engineId}...`);
-      
-      try {
-          const savedTime = currentTime.value;
-          const wasPlaying = isPlaying.value;
-          const session = ++playActionSession; 
-          
-          if (wasPlaying) {
-              await executePauseLogic(session, true); 
-              await new Promise(r => setTimeout(r, 500)); 
-          }
-
-          const res = await invoke<string>('init_audio_engine', { engineId });
-          
-          if (res === "DOWNLOADING") {
-              // 作为冗余的后备处理，防止并发泄漏
-              engine.isDownloadingFFmpeg.value = true;
-              engine.activeEngine.value = previousEngine;
-              if (wasPlaying) await executePlayLogic(session, false);
-              return 'DOWNLOADING';
-          }
-          
-          if (res.includes("READY") || res === "SUCCESS") {
-              engine.hasAudioInitialized.value = true;
-              engine.activeEngine.value = engineId;
-              
-              if (playlist.currentTrack.value) {
-                  // 核心增量：在执行 PlayLogic 前，确保后端知道真正的目标音量
-                  const realTarget = volume.value / 100.0;
-                  setBackendVolume(realTarget); // 恢复引擎切换前的音量状态
-
-                  await invoke('player_load_track', { path: playlist.currentTrack.value.path });
-                  await invoke('player_seek', { time: savedTime });
-                  
-                  if (wasPlaying) await executePlayLogic(session, false); 
-                  else await invoke('player_pause');
-              }
-              
-              engine.isEngineSwitching.value = false;
-              startEngineCoolingTimer(); 
-              return 'SUCCESS';
-          }
-          throw new Error("Invalid response");
-      } catch (e: any) {
-          notifyUI.value?.(`Switch error`, 'error');
-          await syncEngine();
-          engine.isEngineSwitching.value = false; 
-          return 'FAILED';
-      } finally {
-          isSystemBusy.value = false;
-          isBuffering.value = false;
-      }
-  };
-
-  const executePlayLogic = async (session: number, isNewTrack: boolean) => {
-      try {
-        if (isNewTrack && playlist.currentTrack.value) {
-            setBackendVolume(0.0);
-            if (engine.isSmtcEnabled.value) {
-                invoke('sync_smtc_metadata', { 
-                    title: playlist.currentTrack.value.title, 
-                    artist: playlist.currentTrack.value.artist, 
-                    cover: playlist.currentTrack.value.cover 
-                }).catch(()=>{});
-            }
+    const toggleLike = (track: Track) => {
+        const idx = likedQueue.value.findIndex(t => t.id === track.id);
+        if (idx === -1) {
+            likedQueue.value.push(track);
+            likedIdSet.add(track.id);
+        } else {
+            likedQueue.value.splice(idx, 1);
+            likedIdSet.delete(track.id);
         }
-
-        if (session !== playActionSession) return;
-        await invoke('player_play').catch(()=>{});
-        if (session !== playActionSession) return;
-
-        isPlaying.value = true;
-        isPaused.value = false;
-        if (!hasStarted.value) hasStarted.value = true;
-        startProgressLoop(); 
-        
-        // 软启动逻辑：400ms 内平滑淡入到用户设定的音量，防止爆音
-        const targetVol = Math.max(0.001, volume.value / 100.0);
-        
-        smoothVolumeTransition(targetVol, 50, () => {
-            if (session === playActionSession && engine.isSmtcEnabled.value) {
-                invoke('sync_smtc_status', { isPlaying: true }).catch(()=>{});
-            }
-        });
-      } catch (e) { console.error(e); }
-  };
-
-  const executePauseLogic = async (session: number, skipFade = false) => {
-      try {
-          isPlaying.value = false;
-          isPaused.value = true;
-          stopProgressLoop();
-          
-          if (skipFade) {
-              if (fadeRafId !== null) {
-                  cancelAnimationFrame(fadeRafId);
-                  fadeRafId = null;
-              }
-              setBackendVolume(0.0);
-              await invoke('player_pause').catch(()=>{});
-              if (engine.isSmtcEnabled.value) invoke('sync_smtc_status', { isPlaying: false }).catch(()=>{});
-          } else {
-              // 软停止逻辑：300ms 内淡出，确保听觉过渡自然
-              smoothVolumeTransition(0.0, 300, async () => {
-                  if (session === playActionSession) {
-                      await invoke('player_pause').catch(()=>{});
-                      if (engine.isSmtcEnabled.value) invoke('sync_smtc_status', { isPlaying: false }).catch(()=>{});
-                  }
-              });
-          }
-      } catch (e) { console.error(e); }
-      
-  };
-
-  const togglePlay = () => {
-    // 🚀 已剥离 isDownloadingFFmpeg 锁
-    if (isSystemBusy.value || engine.isEngineSwitching.value) return; 
-    if (!playlist.currentTrack.value) return;
-    if (isTrackSwitching.value || isSeeking.value || isBuffering.value) return;
-
-    if (!isPlaying.value && !hasStarted.value) {
-        performTrackSwitch(() => {});
-        return;
-    }
-
-    const intentToPlay = !isPlaying.value; 
-    isPlaying.value = intentToPlay;
-    isPaused.value = !intentToPlay; 
-    
-    const session = ++playActionSession; 
-
-    if (actionTimeoutId) clearTimeout(actionTimeoutId);
-    
-    actionTimeoutId = setTimeout(async () => {
-        if (session !== playActionSession) return; 
-        if (intentToPlay) await executePlayLogic(session, false);
-        else await executePauseLogic(session);
-    }, 50);
-  };
-
-  const loadAndPlay = async (): Promise<void> => {
-    if (!playlist.currentTrack.value) return;
-    
-    playSessionId.value++;
-    isPlaying.value = true;
-    isPaused.value = false;
-    currentTime.value = 0;
-    progress.value = 0;
-    stopProgressLoop();
-
-    const mySession = playSessionId.value;
-    const actionSession = ++playActionSession;
-
-    return new Promise((resolve) => {
-        if (actionTimeoutId) clearTimeout(actionTimeoutId);
-        
-        actionTimeoutId = setTimeout(async () => {
-            if (actionSession !== playActionSession) return resolve();
-
-            let bufferTimeout = setTimeout(() => { isBuffering.value = true; }, 150);
-
-            try {
-                if (!engine.hasAudioInitialized.value && engine.activeDevice.value !== 'Default') {
-                    await invoke('set_output_device', { device: engine.activeDevice.value });
-                    engine.hasAudioInitialized.value = true;
-                }
-
-                const duration = await invoke<number>('player_load_track', { path: playlist.currentTrack.value!.path });
-                
-                clearTimeout(bufferTimeout); 
-
-                if (mySession !== playSessionId.value || actionSession !== playActionSession) {
-                    isBuffering.value = false;
-                    resolve();
-                    return;
-                }
-                
-                if (duration > 0.1) playlist.currentTrack.value!.duration = duration;
-                
-                isBuffering.value = false;
-                await executePlayLogic(actionSession, true);
-            } catch (e) {
-                clearTimeout(bufferTimeout);
-                if (mySession === playSessionId.value) {
-                    isPlaying.value = false;
-                    isPaused.value = true;
-                    isBuffering.value = false;
-                    notifyUI.value?.("Play failed", "error");
-                }
-            } finally {
-                resolve();
-            }
-        }, 50);
-    });
-  };
-
-  const performTrackSwitch = async (updateIndexFn: () => void) => {
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value) return; 
-      if (isTrackSwitching.value) return;
-      isTrackSwitching.value = true; 
-      isSystemBusy.value = true; 
-      
-      const isFirstPlay = !hasStarted.value;
-      const delay = isFirstPlay ? 0 : 450;
-      const wasPlaying = isPlaying.value;
-      const actionSession = ++playActionSession;
-      
-      if (wasPlaying && !isFirstPlay) await executePauseLogic(actionSession); 
-      
-      if (delay > 0) {
-          setTimeout(async () => {
-              updateIndexFn();
-              await loadAndPlay();
-              isTrackSwitching.value = false; 
-              isSystemBusy.value = false; 
-          }, delay);
-      } else {
-          updateIndexFn();
-          await loadAndPlay();
-          isTrackSwitching.value = false; 
-          isSystemBusy.value = false; 
-      }
-  };
-
-  const nextTrack = async () => { 
-      if(playlist.queue.value.length === 0) return; 
-      await performTrackSwitch(() => {
-          if (playlist.playMode.value === 'shuffle') {
-              const total = playlist.queue.value.length;
-              if (total > 1) {
-                  const seed = (Date.now() ^ (playlist.currentIndex.value * 123456789));
-                  const chaos = Math.abs(Math.sin(seed) * 100000.0);
-                  let targetIndex = Math.floor((chaos - Math.floor(chaos)) * total);
-                  if (targetIndex === playlist.currentIndex.value) targetIndex = (targetIndex + 1) % total;
-                  playlist.currentIndex.value = targetIndex;
-              }
-          } else {
-              playlist.currentIndex.value = (playlist.currentIndex.value + 1) % playlist.queue.value.length; 
-          }
-      });
-  };
-
-  const prevTrack = async () => { 
-      if(playlist.queue.value.length === 0) return; 
-      await performTrackSwitch(() => {
-          if (playlist.currentIndex.value > 0) playlist.currentIndex.value = playlist.currentIndex.value - 1;
-          else playlist.currentIndex.value = playlist.queue.value.length - 1;
-      });
-  };
-
-  // 强力播放器逻辑：支持跨列表点火播放，如果歌曲不在主队列则自动注入并起飞
-  const playTrack = async (track: Track) => { 
-      let idx = playlist.queue.value.findIndex(t => t.id === track.id);
-      if (idx === -1) {
-          playlist.queue.value.push({ ...track, isAvailable: true });
-          idx = playlist.queue.value.length - 1;
-      }
-      await performTrackSwitch(() => { playlist.currentIndex.value = idx; }); 
-  };
-
-  const setChannelMode = async (mode: number): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value) return 'FAILED';
-      if (mode === 2) engine.isTrueSurround.value = false;
-      else if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
-      
-      engine.lastMixerActionTime.value = Date.now();
-
-      if (engine.channelMode.value === mode) return 'SUCCESS';
-      
-      isSystemBusy.value = true;
-      isBuffering.value = true;
-
-      try {
-          engine.channelMode.value = mode;
-          localStorage.setItem('channel_mode', mode.toString());
-          localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
-
-          const finalMode = (engine.isTrueSurround.value && mode > 2) ? mode + 100 : mode;
-          //此处修复导入完成后切换环绕Deadlock
-          if (!hasStarted.value) {
-            invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
-            return 'SUCCESS';
-          }
-          await invoke('player_set_channels', { mode: finalMode });
-          
-          if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
-              await invoke('player_seek', { time: currentTime.value });
-          }
-          return 'SUCCESS';
-      } catch (e) {
-          return 'FAILED';
-      } finally {
-          isSystemBusy.value = false;
-          isBuffering.value = false;
-      }
-  };
-
-  const toggleTrueSurround = async (): Promise<'SUCCESS' | 'THROTTLED' | 'FAILED'> => {
-      if (engine.channelMode.value === 2) return 'FAILED';
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value) return 'FAILED';
-      if (Date.now() - engine.lastMixerActionTime.value < 1000) return 'THROTTLED';
-      
-      engine.lastMixerActionTime.value = Date.now();
-
-      isSystemBusy.value = true;
-      isBuffering.value = true;
-
-      try {
-          engine.isTrueSurround.value = !engine.isTrueSurround.value;
-          localStorage.setItem('true_surround', JSON.stringify(engine.isTrueSurround.value));
-
-          const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2) ? engine.channelMode.value + 100 : engine.channelMode.value;
-          if (!hasStarted.value) {
-            invoke('player_set_channels', { mode: finalMode }).catch(()=>{});
-            return 'SUCCESS';
-          }
-          await invoke('player_set_channels', { mode: finalMode });
-          
-          if (playlist.currentTrack.value && !isTrackSwitching.value && !isSeeking.value) {
-              await invoke('player_seek', { time: currentTime.value });
-          }
-          return 'SUCCESS';
-      } catch (e) {
-          return 'FAILED';
-      } finally {
-          isSystemBusy.value = false;
-          isBuffering.value = false;
-      }
-  };
-
-  // ✨ 修复 3：本地 LocalStorage 写操作防抖
-  let volSaveTimeout: any = null;
-  const saveActiveVolume = (v: number) => {
-      if (volSaveTimeout) clearTimeout(volSaveTimeout);
-      volSaveTimeout = setTimeout(() => {
-          localStorage.setItem('last_active_vol', v.toString());
-      }, 500);
-  };
-
-  const setVolume = (v: number) => {
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
-      volume.value = v;
-      if (v > 0) {
-          lastActiveVolume.value = v;
-          saveActiveVolume(v);
-      }
-  };
-
-  const toggleMute = () => {
-      // 🚀 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
-      if (volume.value > 0) {
-          lastActiveVolume.value = volume.value;
-          saveActiveVolume(volume.value);
-          volume.value = 0;
-      } else {
-          volume.value = lastActiveVolume.value;
-      }
-  };
-
-const seekTo = async (percent: number) => {
-    if (engine.isEngineSwitching.value) return; 
-    if (!playlist.currentTrack.value || playlist.currentTrack.value.duration <= 0) return;
-
-    const wasPlaying = isPlaying.value && !isPaused.value;
-    isSeeking.value = true; 
-    
-    // 绝对禁止在这里写 isSystemBusy.value = true！这是万恶之源！
-    
-    const actionSession = ++playActionSession; 
-    
-    if (wasPlaying) {
-        isPlaying.value = false;
-        isPaused.value = true;
-        // 🔥 黑子爆破：把原来那 150ms 的 smoothVolumeTransition 淡出抛弃，直接发暂停指令追求极致 0 延迟！
-        await invoke('player_pause').catch(()=>{});
-    } 
-    
-    // 如果在你 seek 期间有新的点击进来，旧的直接被抛弃，不再锁死状态
-    if (actionSession !== playActionSession) {
-        isSeeking.value = false; 
-        return;
-    }
-
-    const targetTime = (percent / 100) * playlist.currentTrack.value.duration;
-    progress.value = percent; 
-    currentTime.value = targetTime;
-    
-    try { 
-        await invoke('player_seek', { time: targetTime }); 
-    } catch (e) {
-    } finally {
-        if (actionSession === playActionSession) {
-            isSeeking.value = false; 
-            if (wasPlaying) {
-                isPlaying.value = true;
-                isPaused.value = false;
-                await executePlayLogic(actionSession, false);
-            }
-        }
-    }
-  };
-
-  let listenersBound = false;
-
-  const setupEventListeners = async () => {
-    if (listenersBound) return;
-    listenersBound = true;
-    
-    await listen<number>('import-start', (e) => {
-        importTotal.value = e.payload; importCount.value = 0; importProgress.value = 0;
-    });
-    
-    await listen<Track>('import-track', (e) => {
-        const t = e.payload;
-        if (!playlist.queue.value.some(track => track.path === t.path)) {
-            playlist.queue.value.push({ 
-                ...t, 
-                id: Date.now().toString() + Math.random().toString(36).substring(2, 8), 
-                cover: t.cover === 'DEFAULT_COVER' ? DEFAULT_COVER : t.cover, 
-                isAvailable: true 
-            });
-        }
-        importCount.value++;
-        if (importTotal.value > 0) importProgress.value = (importCount.value / importTotal.value) * 100;
-    });
-    
-    await listen('import-finish', () => { 
-        isImporting.value = false; 
-        setTimeout(() => notifyUI.value?.('Library updated'), 400); 
-    });
-    
-    await listen('import-cancel', () => { isImporting.value = false; });
-    
-    await listen<number>('seek-end', (e) => {
-        if (isSystemBusy.value || isSeeking.value || isDragging.value || isBuffering.value) return; 
-        if (Math.abs(currentTime.value - e.payload) > 1.0) {
-            currentTime.value = e.payload;
-            if (playlist.currentTrack.value && playlist.currentTrack.value.duration > 0) {
-                progress.value = (e.payload / playlist.currentTrack.value.duration) * 100;
-            }
-        }
-    });
-
-    await listen('force-pause', () => { 
-        isPlaying.value = false; isPaused.value = true; stopProgressLoop();
-    });
-  };
-
-  const importTracks = async () => { 
-      if (isImporting.value) return;
-      await setupEventListeners(); 
-      isImporting.value = true; importProgress.value = 0; importCount.value = 0; importTotal.value = 0;
-      try { await invoke('import_music'); } catch(e) { isImporting.value = false; } 
-  };
-  
-  const initCheck = async () => { 
-      await setupEventListeners(); 
-      playlist.queue.value.forEach(track => {
-          invoke('check_file_exists', { path: track.path })
-            .then((exists) => { track.isAvailable = exists as boolean; })
-            .catch(() => { track.isAvailable = false; });
-      });
-  };
-
-  let rafId: number | null = null;
-  let lastFrameTime = 0;
-
-  // 修复：在这里加入 FPS 节流，稳定限制在最高 60 FPS
-  const startProgressLoop = () => {
-    stopProgressLoop();
-    lastFrameTime = performance.now();
-    
-    // 这里的 loop 是我新定义的内部函数，timestamp 是浏览器原生 API 自动传给它的！
-    const loop = (timestamp: number) => {
-      if (!isPlaying.value || isPaused.value) return; 
-      
-      const elapsed = timestamp - lastFrameTime;
-      
-      // 拦截器：如果距离上一帧还不到 16.6ms (60FPS)，就跳过
-      if (elapsed < 16.6) {
-          rafId = requestAnimationFrame(loop);
-          return;
-      }
-      
-      const deltaTime = elapsed / 1000; 
-      lastFrameTime = timestamp;
-      
-      if (!isDragging.value && !isBuffering.value && !isSeeking.value && !isSystemBusy.value && playlist.currentTrack.value) {
-          currentTime.value += deltaTime;
-          if (currentTime.value >= playlist.currentTrack.value.duration) {
-             if (playlist.playMode.value === 'loop') { 
-                 currentTime.value = 0; invoke('player_seek', { time: 0.0 }); 
-             } else { nextTrack(); return; }
-          }
-          if (playlist.currentTrack.value.duration > 0) {
-              progress.value = (currentTime.value / playlist.currentTrack.value.duration) * 100;
-          }
-      }
-      
-      rafId = requestAnimationFrame(loop);
     };
-    rafId = requestAnimationFrame(loop);
-  };
+    const isLiked = (track: Track) => likedIdSet.has(track.id);
 
-  const stopProgressLoop = () => { 
-      if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } 
-  };
+    const volumeGuard = () =>
+        isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value;
 
-  watch(volume, (v) => { 
-      // 已剥离 isDownloadingFFmpeg 锁
-      if (isSystemBusy.value || engine.isEngineSwitching.value || isBuffering.value || isSeeking.value) return;
+    const setVolume = (v: number) => vol.setVolume(v, volumeGuard);
+    const toggleMute = () => vol.toggleMute(volumeGuard);
 
-      const target = v / 100.0;
-      
-      if (isPlaying.value && !isPaused.value) {
-          if (fadeRafId !== null) {
-              smoothVolumeTransition(target, 150);
-          } else {
-              setBackendVolume(target);
-          }
-      }
-  });
+    const progressCtrl = useProgress({
+        isPlaying, isPaused, isDragging, isBuffering, isSeeking, isSystemBusy,
+        currentTime, progress,
+        currentTrack: computed(() => playlist.currentTrack.value as { duration: number } | null),
+        playMode: computed(() => playlist.playMode.value),
+        onTrackEnd: () => { playback.nextTrack(); },
+    });
 
-  const showCredits = ref(false);
-  let wasPlayingBeforeCredits = false;
+    const playback = usePlayback({
+        isPlaying, isPaused, hasStarted, isSystemBusy, isBuffering, isSeeking,
+        isDragging, isTrackSwitching, currentTime, progress, playSessionId,
+        volume: vol.volume, notifyUI,
+        queue: playlist.queue, currentIndex: playlist.currentIndex,
+        currentTrack: computed(() => playlist.currentTrack.value),
+        playMode: computed(() => playlist.playMode.value),
+        activeEngine: engine.activeEngine,
+        isEngineSwitching: engine.isEngineSwitching,
+        isDownloadingFFmpeg: engine.isDownloadingFFmpeg,
+        hasAudioInitialized: engine.hasAudioInitialized,
+        activeDevice: engine.activeDevice,
+        isSmtcEnabled: engine.isSmtcEnabled,
+        lastEngineSwitchTime: engine.lastEngineSwitchTime,
+        lastMixerActionTime: engine.lastMixerActionTime,
+        engineCoolingRemaining: engine.engineCoolingRemaining,
+        channelMode: engine.channelMode,
+        isTrueSurround: engine.isTrueSurround,
+        setBackendVolume: vol.setBackendVolume,
+        smoothVolumeTransition: vol.smoothVolumeTransition,
+        cancelFade: vol.cancelFade,
+        startProgressLoop: progressCtrl.startProgressLoop,
+        stopProgressLoop: progressCtrl.stopProgressLoop,
+        refreshAnchor: progressCtrl.refreshAnchor,
+        setAnchorLocal: progressCtrl.setAnchorLocal,
+        freezeAnchor: progressCtrl.freezeAnchor,
+    });
 
-  const startCredits = async () => {
-      wasPlayingBeforeCredits = isPlaying.value && !isPaused.value;
-      if (wasPlayingBeforeCredits) {
-          const session = ++playActionSession;
-          isPlaying.value = false;
-          isPaused.value = true;
-          await executePauseLogic(session, false); 
-      }
-      showCredits.value = true;
-  };
+    const importer = useImporter({
+        queue: playlist.queue,
+        isImporting, importCount, importTotal, importProgress, notifyUI,
+    });
 
-  const endCredits = async () => {
-      showCredits.value = false;
-      if (wasPlayingBeforeCredits) {
-          const session = ++playActionSession;
-          isPlaying.value = true;
-          isPaused.value = false;
-          await executePlayLogic(session, false); 
-      }
-  };
+    const persistence = usePersistence({
+        volume: vol.volume, lastActiveVolume: vol.lastActiveVolume,
+        activeEngine: engine.activeEngine, channelMode: engine.channelMode,
+        isTrueSurround: engine.isTrueSurround, activeDevice: engine.activeDevice,
+        likedQueue, likedIdSet, needsInitialization, notifyUI,
+    });
 
-  return { 
-    ...playlist,
-    ...engine,
-    isPlaying, isPaused, hasStarted, volume, progress, currentTime, 
-    isDragging, isBuffering, isSeeking, isSystemBusy, playSessionId, isTrackSwitching, 
-    isImporting, importCount, importTotal, importProgress, lastActiveVolume, showCredits, needsInitialization,
+    const ffmpegHandler = useFFmpegHandler({
+        isDownloadingFFmpeg: engine.isDownloadingFFmpeg,
+        ffmpegProgress: engine.ffmpegProgress,
+        isEngineSwitching: engine.isEngineSwitching,
+        hasAudioInitialized: engine.hasAudioInitialized,
+        activeEngine: engine.activeEngine,
+        isSystemBusy, isBuffering, isPlaying,
+        currentTime, volume: vol.volume, notifyUI,
+        currentTrackPath: () => playlist.currentTrack.value?.path || null,
+        setBackendVolume: vol.setBackendVolume,
+        executePauseLogic: playback.executePauseLogic,
+        executePlayLogic: playback.executePlayLogic,
+        getPlayActionSession: playback.getPlayActionSession,
+        incrementPlayActionSession: playback.incrementPlayActionSession,
+        startEngineCoolingTimer: playback.startEngineCoolingTimer,
+    });
 
-    likedQueue, toggleLike, isLiked,
-    setNotifier, setVolume, toggleMute, togglePlay, nextTrack, prevTrack, 
-    seekTo, switchEngine, loadAndPlay, initCheck, importTracks, 
-    setOutputDevice, playTrack, setChannelMode, toggleTrueSurround, 
-    startCredits, endCredits
-  };
+    const credits = useCredits({
+        isPlaying, isPaused,
+        executePauseLogic: playback.executePauseLogic,
+        executePlayLogic: playback.executePlayLogic,
+        incrementPlayActionSession: playback.incrementPlayActionSession,
+    });
+
+    watch(vol.volume, (v) => {
+        if (volumeGuard()) return;
+        const target = v / 100.0;
+        if (isPlaying.value && !isPaused.value) {
+            if (vol.isFading()) {
+                vol.smoothVolumeTransition(target, 150);
+            } else {
+                vol.setBackendVolume(target);
+            }
+        }
+    });
+
+    onMounted(async () => {
+        await playback.syncEngine();
+
+        const settings = await persistence.restoreData();
+        if (settings) {
+            const initialVol = Math.pow(vol.volume.value / 100.0, 2);
+            invoke('player_set_volume', { vol: initialVol }).catch(() => {});
+
+            const finalMode = (engine.isTrueSurround.value && engine.channelMode.value > 2)
+                ? engine.channelMode.value + 100
+                : engine.channelMode.value;
+            invoke('player_set_channels', { mode: finalMode }).catch(() => {});
+
+            if (engine.activeEngine.value !== 'galaxy') {
+                invoke('init_audio_engine', { engineId: engine.activeEngine.value }).catch(() => {});
+            }
+        }
+
+        await ffmpegHandler.setupFFmpegListeners();
+        await importer.setupImportListeners();
+        await playback.setupPlaybackListeners();
+
+        persistence.startPersistenceWatch();
+        progressCtrl.startGlobalSyncTimer();
+    });
+
+    return {
+        ...playlist,
+        ...engine,
+        isPlaying, isPaused, hasStarted,
+        volume: vol.volume, lastActiveVolume: vol.lastActiveVolume,
+        progress, currentTime,
+        isDragging, isBuffering, isSeeking, isSystemBusy,
+        playSessionId, isTrackSwitching,
+        isImporting, importCount, importTotal, importProgress,
+        needsInitialization,
+        showCredits: credits.showCredits,
+        likedQueue, toggleLike, isLiked,
+        setNotifier, setVolume, toggleMute,
+        togglePlay: playback.togglePlay,
+        nextTrack: playback.nextTrack,
+        prevTrack: playback.prevTrack,
+        playTrack: playback.playTrack,
+        seekTo: playback.seekTo,
+        loadAndPlay: playback.loadAndPlay,
+        switchEngine: playback.switchEngine,
+        setOutputDevice: playback.setOutputDevice,
+        setChannelMode: playback.setChannelMode,
+        toggleTrueSurround: playback.toggleTrueSurround,
+        initCheck: importer.initCheck,
+        importTracks: importer.importTracks,
+        startCredits: credits.startCredits,
+        endCredits: credits.endCredits,
+    };
 });
