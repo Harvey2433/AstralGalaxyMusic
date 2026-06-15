@@ -50,7 +50,7 @@ crossbeam-channel = "0.5"
 zip = "2.2"  
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
 tokio = { version = "1.50.0", features = ["time"] }
-
+arc-swap = "1.7"
 
 # Dev 3级优化配置
 [profile.dev.package."*"]
